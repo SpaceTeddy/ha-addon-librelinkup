@@ -10,7 +10,7 @@ startup: services
 boot: auto
 init: false
 
-image: "ghcr.io/SpaceTeddy/https://github.com/SpaceTeddy/ha-addon-librelinkup"
+image: "ghcr.io/spaceteddy/ha-addon-librelinkup-mqtt"
 
 options:
   email: ""
