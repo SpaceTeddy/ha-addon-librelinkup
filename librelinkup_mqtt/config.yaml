@@ -1,6 +1,6 @@
 name: LibreLinkUp MQTT
-slug: librelinkup_mqtt
 version: "1.0.2"
+slug: librelinkup_mqtt
 description: Fetch LibreLinkUp data and publish to MQTT (raw + filtered)
 url: https://github.com/SpaceTeddy/ha-addon-librelinkup
 
@@ -9,11 +9,17 @@ arch:
   - aarch64
   - armv7
 
-startup: services
 init: false
+startup: application
+boot: auto
+stage: stable
 
-# Wichtig: GHCR image name muss lowercase sein
-image: "ghcr.io/spaceteddy/ha-addon-librelinkup"
+# Discovery/UDP/MDNS
+host_network: true
+
+# if TLS-CA refers from /config :
+map:
+  - config:ro
 
 services:
   - mqtt:need
