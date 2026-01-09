@@ -3,6 +3,7 @@ set -eu
 
 OPTIONS="/data/options.json"
 
+# --- Required ---
 EMAIL="$(jq -r '.email // ""' "$OPTIONS")"
 PASSWORD="$(jq -r '.password // ""' "$OPTIONS")"
 
@@ -11,6 +12,7 @@ if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then
   exit 1
 fi
 
+# --- Optional / Defaults ---
 INTERVAL="$(jq -r '.interval // 60' "$OPTIONS")"
 FETCH_OFFSET="$(jq -r '.fetch_offset // 5.0' "$OPTIONS")"
 TZ="$(jq -r '.tz // "Europe/Berlin"' "$OPTIONS")"
@@ -28,18 +30,30 @@ RETAIN="$(jq -r '.mqtt_retain // true' "$OPTIONS")"
 QOS="$(jq -r '.mqtt_qos // 0' "$OPTIONS")"
 DEBUG="$(jq -r '.debug // false' "$OPTIONS")"
 
-ARGS="--email \"$EMAIL\" --password \"$PASSWORD\" --loop --interval $INTERVAL --fetch-offset $FETCH_OFFSET --tz \"$TZ\""
+# Build a real argv list (NO string building, NO eval, NO sh -c)
+set -- python3 /main.py \
+  --email "$EMAIL" \
+  --password "$PASSWORD" \
+  --loop \
+  --interval "$INTERVAL" \
+  --fetch-offset "$FETCH_OFFSET" \
+  --tz "$TZ" \
+  --mqtt-publish \
+  --mqtt-host "$MQTT_HOST" \
+  --mqtt-port "$MQTT_PORT" \
+  --mqtt-base-topic "$MQTT_BASE_TOPIC" \
+  --master-id "$MASTER_ID" \
+  --mqtt-qos "$QOS"
 
-[ "$DEBUG" = "true" ] && ARGS="$ARGS --debug"
+# Optional flags
+[ "$DEBUG" = "true" ] && set -- "$@" --debug
+[ "$RETAIN" = "true" ] && set -- "$@" --mqtt-retain
+[ "$PUBLISH_RAW" = "true" ] && set -- "$@" --mqtt-publish-raw
+[ "$PUBLISH_FILTERED" = "true" ] && set -- "$@" --mqtt-publish-filtered
 
-ARGS="$ARGS --mqtt-publish --mqtt-host \"$MQTT_HOST\" --mqtt-port $MQTT_PORT"
-ARGS="$ARGS --mqtt-base-topic \"$MQTT_BASE_TOPIC\" --master-id \"$MASTER_ID\" --mqtt-qos $QOS"
-
-[ -n "$MQTT_USER" ] && ARGS="$ARGS --mqtt-user \"$MQTT_USER\""
-[ -n "$MQTT_PASSWORD" ] && ARGS="$ARGS --mqtt-password \"$MQTT_PASSWORD\""
-[ "$RETAIN" = "true" ] && ARGS="$ARGS --mqtt-retain"
-[ "$PUBLISH_RAW" = "true" ] && ARGS="$ARGS --mqtt-publish-raw"
-[ "$PUBLISH_FILTERED" = "true" ] && ARGS="$ARGS --mqtt-publish-filtered"
+# Optional MQTT credentials
+[ -n "$MQTT_USER" ] && set -- "$@" --mqtt-user "$MQTT_USER"
+[ -n "$MQTT_PASSWORD" ] && set -- "$@" --mqtt-password "$MQTT_PASSWORD"
 
 echo "[info] Starting LibreLinkUp MQTT add-on"
-exec sh -c "python3 /main.py $ARGS"
+exec "$@"
