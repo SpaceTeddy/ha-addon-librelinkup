@@ -1,19 +1,19 @@
-name: "LibreLinkUp MQTT"
-slug: "librelinkup_mqtt"
-description: "Fetch LibreLinkUp data and publish to MQTT (raw + ESP32-compatible filtered JSON)."
-version: "1.0.0"
+name: LibreLinkUp MQTT
+slug: librelinkup_mqtt
+version: "1.0.2"
+description: Fetch LibreLinkUp data and publish to MQTT (raw + filtered)
+url: https://github.com/SpaceTeddy/ha-addon-librelinkup
 
 arch:
   - amd64
   - aarch64
   - armv7
 
-# >>> DAS IST DER ENTSCHEIDENDE TEIL <<<
-image: "ghcr.io/spaceteddy/ha-addon-librelinkup"
-
 startup: services
-boot: auto
 init: false
+
+# Wichtig: GHCR image name muss lowercase sein
+image: "ghcr.io/spaceteddy/ha-addon-librelinkup"
 
 services:
   - mqtt:need
@@ -22,56 +22,42 @@ options:
   email: ""
   password: ""
 
-  mqtt_host: "core-mosquitto"
-  mqtt_port: 1883
-  mqtt_user: ""
-  mqtt_password: ""
-
-  mqtt_base_topic: "librelinkup"
-  master_id: "MASTER"
-
-  mqtt_topic_raw_suffix: "data_raw"
-  mqtt_topic_filtered_suffix: "data"
-
-  publish_raw: false
-  publish_filtered: true
-
-  mqtt_retain: true
-  mqtt_qos: 0
-
   interval: 60
   fetch_offset: 5.0
   tz: "Europe/Berlin"
 
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  mqtt_base_topic: "librelinkup"
+  master_id: "MASTER"
+
+  publish_raw: false
+  publish_filtered: true
+  mqtt_retain: true
+  mqtt_qos: 0
+
   debug: false
-  print_raw: false
-  print_filtered: false
 
 schema:
   email: str
   password: password
 
-  mqtt_host: str
-  mqtt_port: int
-  mqtt_user: str
-  mqtt_password: password
-
-  mqtt_base_topic: str
-  master_id: str
-
-  mqtt_topic_raw_suffix: str
-  mqtt_topic_filtered_suffix: str
-
-  publish_raw: bool
-  publish_filtered: bool
-
-  mqtt_retain: bool
-  mqtt_qos: int(0,2)
-
   interval: int(10,3600)
   fetch_offset: float(0,60)
   tz: str
 
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str?
+  mqtt_password: password?
+  mqtt_base_topic: str
+  master_id: str
+
+  publish_raw: bool
+  publish_filtered: bool
+  mqtt_retain: bool
+  mqtt_qos: int(0,2)
+
   debug: bool
-  print_raw: bool
-  print_filtered: bool
