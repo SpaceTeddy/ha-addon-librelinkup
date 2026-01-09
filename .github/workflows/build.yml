@@ -1,37 +1,81 @@
-name: Build and publish add-on image
+name: Build & Publish Add-on to GHCR
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
     tags:
-      - "v*.*.*"
-  workflow_dispatch:
+      - 'v*'
 
-permissions:
-  contents: read
-  packages: write
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: spaceteddy/librelinkup_mqtt
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      # Version aus librelinkup_mqtt/config.yaml lesen (Feld: version: "x.y.z")
+      - name: Read version from librelinkup_mqtt/config.yaml
+        id: ver
+        shell: bash
+        run: |
+          RAW=$(grep -E '^version:' librelinkup_mqtt/config.yaml | head -n1 || true)
+          VER=$(echo "$RAW" | sed -E 's/^[^"]+"([^"]+)".*$/\1/')
+          if [[ -z "$VER" ]]; then
+            VER="latest"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      # Optionales Git-Tag (vX.Y.Z) in X.Y.Z umwandeln
+      - name: Determine tag from ref (optional)
+        id: ref
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME#v}"
+          else
+            TAG=""
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Tags vorbereiten (ohne leeres drittes Tag)
+      - name: Prepare tag list
+        id: prep
+        shell: bash
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          if [[ -n "${{ steps.ref.outputs.tag }}" ]]; then
+            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ref.outputs.tag }}"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build & Push (multi-arch manifest)
+        uses: docker/build-push-action@v6
         with:
           context: ./librelinkup_mqtt
           file: ./librelinkup_mqtt/Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: |
-            ghcr.io/spaceteddy/ha-addon-librelinkup:latest
-            ghcr.io/spaceteddy/ha-addon-librelinkup:${{ github.ref_name }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: ${{ steps.prep.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
