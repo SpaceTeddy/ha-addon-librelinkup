@@ -321,7 +321,7 @@ class MqttPublisher:
         self.debug = debug
 
         self._connected = False
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         if user:
             self.client.username_pw_set(user, password=password)
 
