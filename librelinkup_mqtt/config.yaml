@@ -1,0 +1,36 @@
+name: "LibreLinkUp MQTT"
+slug: "librelinkup_mqtt"
+version: "1.0.0"
+description: "Fetch LibreLinkUp data and publish to MQTT"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+
+image: "ghcr.io/SpaceTeddy/https://github.com/SpaceTeddy/ha-addon-librelinkup"
+
+options:
+  email: ""
+  password: ""
+  mqtt_host: "192.168.0.202"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  mqtt_base_topic: "librelinkup"
+  master_id: "MASTER_TEST"
+  interval: 60
+  fetch_offset: 5.0
+schema:
+  email: str
+  password: password
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str?
+  mqtt_password: password?
+  mqtt_base_topic: str
+  master_id: str
+  interval: int
+  fetch_offset: float
