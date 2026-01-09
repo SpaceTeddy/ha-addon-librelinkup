@@ -301,6 +301,17 @@ def adapt_offset(
 # -----------------------------
 
 class MqttPublisher:
+    
+    def _mqtt_new_client(client_id: str | None = None):
+        # paho-mqtt 2.x: Callback API v2 nutzen (entfernt DeprecationWarning)
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            return mqtt.Client(
+                client_id=client_id or "",
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+            )
+        # paho-mqtt 1.x fallback
+        return mqtt.Client(client_id=client_id or "")
+    
     def __init__(
         self,
         host: str,
@@ -321,7 +332,7 @@ class MqttPublisher:
         self.debug = debug
 
         self._connected = False
-        self.client = mqtt.Client()
+        self.client = _mqtt_new_client()
         if user:
             self.client.username_pw_set(user, password=password)
 
