@@ -1,7 +1,7 @@
 name: "LibreLinkUp MQTT"
 slug: "librelinkup_mqtt"
 description: "Fetch LibreLinkUp data and publish to MQTT (raw + ESP32-compatible filtered JSON)."
-version: "1.0.0"
+version: "1.0.1"
 
 arch:
   - amd64
