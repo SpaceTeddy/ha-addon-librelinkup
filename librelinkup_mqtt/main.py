@@ -301,7 +301,6 @@ def adapt_offset(
 # -----------------------------
 
 class MqttPublisher:
-    
     def __init__(
         self,
         host: str,
