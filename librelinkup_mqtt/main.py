@@ -332,7 +332,7 @@ class MqttPublisher:
         self.debug = debug
 
         self._connected = False
-        self.client = self._mqtt_new_client()
+        self.client = mqtt_client()
         if user:
             self.client.username_pw_set(user, password=password)
 
