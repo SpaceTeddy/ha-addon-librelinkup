@@ -86,6 +86,14 @@ def now_ts(tz) -> datetime:
     return datetime.now(tz) if tz else datetime.now()
 
 
+def iso_now(tz) -> str:
+    return now_ts(tz).isoformat()
+
+
+def iso_dt(dt: Optional[datetime]) -> str:
+    return dt.isoformat() if dt else ""
+
+
 def parse_libreview_ts(ts: str, tz) -> Optional[datetime]:
     # Example: "1/9/2026 10:41:01 AM"
     if not ts:
@@ -101,6 +109,13 @@ def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
     # next multiple of period + offset
     base = (int(epoch_now) // period_s + 1) * period_s
     return base + offset_s
+
+
+def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
+    dt = parse_libreview_ts(cloud_ts_str or "", tz)
+    if not dt:
+        return None
+    return (now_ts(tz) - dt).total_seconds()
 
 
 # -----------------------------
@@ -170,7 +185,6 @@ class LibreLinkUpClient:
         self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
         r.raise_for_status()
 
-        # Login-Response ist manchmal klein -> bei Fehlern: {"status":2,...}
         try:
             data = r.json()
         except Exception:
@@ -187,7 +201,6 @@ class LibreLinkUpClient:
         country = str(user.get("country", "")) if user else ""
 
         if not user_id or not token:
-            # besserer Fehlertext inkl. möglicher "error"/"message"
             err = data.get("error") or data.get("message") or data.get("reason") or ""
             body_short = json.dumps(data, ensure_ascii=False)[:300]
             raise RuntimeError(
@@ -348,7 +361,7 @@ def adapt_offset(
 
 
 # -----------------------------
-# MQTT persistent publisher
+# MQTT persistent publisher (+ status/health + LWT)
 # -----------------------------
 
 class MqttPublisher:
@@ -359,6 +372,9 @@ class MqttPublisher:
         user: str,
         password: str,
         keepalive: int,
+        base_topic: str,
+        master_id: str,
+        tz,
         logger: logging.Logger,
     ):
         if mqtt is None:
@@ -369,9 +385,13 @@ class MqttPublisher:
         self.user = user
         self.password = password
         self.keepalive = keepalive
+        self.base_topic = (base_topic or "").strip("/")
+        self.master_id = (master_id or "").strip("/")
+        self.tz = tz
         self.log = logger
 
         self._connected = False
+        self.reconnects = 0
 
         # Du willst die DeprecationWarning erstmal behalten -> so lassen
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
@@ -382,9 +402,31 @@ class MqttPublisher:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
 
+        # Topics
+        self.topic_status = f"{self.base_topic}/{self.master_id}/status"
+        self.topic_health = f"{self.base_topic}/{self.master_id}/health"
+
+        # LWT: offline retained
+        lwt_payload = json_dumps_compact({
+            "state": "offline",
+            "ts_local": iso_now(self.tz),
+            "reason": "lwt",
+        })
+        self.client.will_set(self.topic_status, payload=lwt_payload, qos=0, retain=True)
+
     def _on_connect(self, client, userdata, flags, rc):
         self._connected = (rc == 0)
         self.log.debug("[mqtt] on_connect rc=%s connected=%s", rc, self._connected)
+
+        # publish online retained
+        if self._connected:
+            try:
+                self.publish_json(self.topic_status, {
+                    "state": "online",
+                    "ts_local": iso_now(self.tz),
+                }, retain=True, qos=0)
+            except Exception as ex:
+                self.log.warning("[mqtt] failed to publish online status: %s", ex)
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
@@ -405,10 +447,11 @@ class MqttPublisher:
     def ensure_connected(self):
         if self._connected:
             return
-        self.log.warning("[mqtt] not connected -> reconnecting…")
+        self.reconnects += 1
+        self.log.warning("[mqtt] not connected -> reconnecting… (count=%s)", self.reconnects)
+
         self.client.reconnect()
 
-        # kurz warten
         t0 = time.time()
         while not self._connected and (time.time() - t0) < 5:
             time.sleep(0.05)
@@ -422,7 +465,24 @@ class MqttPublisher:
         info = self.client.publish(topic, payload=payload, qos=qos, retain=retain)
         info.wait_for_publish(timeout=10)
 
+    def publish_json(self, topic: str, obj: Dict[str, Any], retain: bool, qos: int):
+        self.publish(topic, json_dumps_compact(obj), retain=retain, qos=qos)
+
+    def publish_health(self, obj: Dict[str, Any], retain: bool = True, qos: int = 0):
+        self.publish_json(self.topic_health, obj, retain=retain, qos=qos)
+
     def close(self):
+        # optional: graceful offline (kein LWT, aber "clean shutdown")
+        try:
+            if self._connected:
+                self.publish_json(self.topic_status, {
+                    "state": "offline",
+                    "ts_local": iso_now(self.tz),
+                    "reason": "shutdown",
+                }, retain=True, qos=0)
+        except Exception:
+            pass
+
         try:
             self.client.loop_stop()
         except Exception:
@@ -449,6 +509,30 @@ def token_is_valid(login: Optional[LoginResult], min_valid_for_s: int) -> bool:
         return False
     now = int(time.time())
     return (login.expires - now) > min_valid_for_s
+
+
+# -----------------------------
+# Health state
+# -----------------------------
+
+@dataclass
+class HealthState:
+    start_epoch: float = 0.0
+
+    last_fetch_start: Optional[datetime] = None
+    last_fetch_ok: Optional[datetime] = None
+    last_fetch_fail: Optional[datetime] = None
+
+    fetch_ok_count: int = 0
+    fetch_err_count: int = 0
+    last_error: str = ""
+
+    last_fetch_duration_ms: Optional[int] = None
+
+    last_cloud_ts: str = ""
+    last_cloud_lag_s: Optional[float] = None
+
+    relogin_count: int = 0
 
 
 # -----------------------------
@@ -516,6 +600,10 @@ def main():
     p.add_argument("--mqtt-retain", action="store_true", help="MQTT retain flag")
     p.add_argument("--mqtt-qos", type=int, default=0, choices=[0, 1, 2], help="MQTT QoS (0/1/2)")
 
+    # Health publishing toggle (optional)
+    p.add_argument("--mqtt-publish-health", action="store_true", help="Publish health JSON to .../health (default on in addon)")
+    p.add_argument("--mqtt-health-retain", action="store_true", help="Retain health topic (default off unless set)")
+
     args = p.parse_args()
 
     # timezone
@@ -543,7 +631,6 @@ def main():
         logger=logger,
     )
 
-    # MQTT persistent setup (optional)
     mqtt_pub: Optional[MqttPublisher] = None
     if args.mqtt_publish:
         mqtt_pub = MqttPublisher(
@@ -552,11 +639,15 @@ def main():
             user=args.mqtt_user,
             password=args.mqtt_password,
             keepalive=args.mqtt_keepalive,
+            base_topic=args.mqtt_base_topic,
+            master_id=args.master_id,
+            tz=tz,
             logger=logger,
         )
         mqtt_pub.connect()
 
     auth = AuthCache()
+    health = HealthState(start_epoch=time.time())
 
     def ensure_login() -> LoginResult:
         if token_is_valid(auth.login, args.token_min_valid):
@@ -593,70 +684,145 @@ def main():
     def resolve_publish_modes() -> Tuple[bool, bool]:
         """
         Wenn der User explizit Flags setzt -> respektieren.
-        Wenn keine Flags gesetzt -> Default: raw=False, filtered=True (wie dein ESP32 Use-Case).
+        Wenn keine Flags gesetzt -> Default: raw=False, filtered=True.
         """
         any_flag = bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
         if any_flag:
             return bool(args.mqtt_publish_raw), bool(args.mqtt_publish_filtered)
         return False, True
 
+    def token_valid_for_s() -> Optional[int]:
+        if not auth.login:
+            return None
+        return max(0, int(auth.login.expires - time.time()))
+
+    def publish_health(fetch_offset_s: float):
+        if not (args.mqtt_publish and mqtt_pub):
+            return
+        if not args.mqtt_publish_health:
+            return
+
+        payload = {
+            "ts_local": iso_now(tz),
+            "uptime_s": int(time.time() - health.start_epoch),
+
+            "fetch": {
+                "ok": (health.last_error == ""),
+                "last_start": iso_dt(health.last_fetch_start),
+                "last_ok": iso_dt(health.last_fetch_ok),
+                "last_fail": iso_dt(health.last_fetch_fail),
+                "duration_ms": health.last_fetch_duration_ms,
+                "ok_count": health.fetch_ok_count,
+                "err_count": health.fetch_err_count,
+                "last_error": health.last_error,
+            },
+
+            "cloud": {
+                "ts": health.last_cloud_ts,
+                "lag_s": health.last_cloud_lag_s,
+                "fetch_offset_s": float(fetch_offset_s),
+                "target_lag_s": float(args.fetch_offset_target_lag),
+            },
+
+            "auth": {
+                "token_valid_for_s": token_valid_for_s(),
+                "relogin_count": health.relogin_count,
+            },
+
+            "mqtt": {
+                "connected": bool(mqtt_pub._connected),
+                "reconnects": int(mqtt_pub.reconnects),
+            }
+        }
+
+        mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
+
     def one_cycle(fetch_offset_s: float) -> float:
-        # 1) login reuse
-        login = ensure_login()
+        health.last_fetch_start = now_ts(tz)
+        t0 = time.time()
 
-        # 2) fetch graph (if 401 -> relogin once and retry)
-        logger.debug("=== FETCH GRAPH ===")
         try:
-            raw = client.get_graph(login.user_id, login.token, login.account_id)
-        except PermissionError:
-            logger.warning("[auth] 401 -> relogin and retry once")
-            auth.login = None
+            # 1) login reuse
             login = ensure_login()
-            raw = client.get_graph(login.user_id, login.token, login.account_id)
 
-        filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
+            # 2) fetch graph (if 401 -> relogin once and retry)
+            logger.debug("=== FETCH GRAPH ===")
+            try:
+                raw = client.get_graph(login.user_id, login.token, login.account_id)
+            except PermissionError:
+                logger.warning("[auth] 401 -> relogin and retry once")
+                auth.login = None
+                health.relogin_count += 1
+                login = ensure_login()
+                raw = client.get_graph(login.user_id, login.token, login.account_id)
 
-        # 3) print
-        if args.print_raw:
-            print("=== RAW GRAPH JSON ===")
-            print(json.dumps(raw, indent=2, ensure_ascii=False))
+            filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
 
-        if args.print_filtered:
-            print("=== FILTERED GRAPH JSON (ESP32 compatible) ===")
-            print(json.dumps(filtered, indent=2, ensure_ascii=False))
+            # cloud timestamp & lag
+            cloud_ts_str = (
+                ((filtered.get("data") or {}).get("connection") or {})
+                .get("glucoseMeasurement", {})
+                .get("Timestamp")
+            )
+            health.last_cloud_ts = cloud_ts_str or ""
+            health.last_cloud_lag_s = compute_cloud_lag_s(cloud_ts_str, tz)
 
-        # 4) sync adapt offset based on measurement timestamp
-        meas_ts_str = (
-            ((filtered.get("data") or {}).get("connection") or {})
-            .get("glucoseMeasurement", {})
-            .get("Timestamp")
-        )
-        fetch_offset_s = adapt_offset(
-            current_offset=fetch_offset_s,
-            meas_timestamp_str=meas_ts_str,
-            tz=tz,
-            desired_lag_s=args.fetch_offset_target_lag,
-            gain=args.fetch_offset_gain,
-            max_step_s=args.fetch_offset_max_step,
-            offset_min_s=args.fetch_offset_min,
-            offset_max_s=args.fetch_offset_max,
-            logger=logger,
-        )
+            # 3) print
+            if args.print_raw:
+                print("=== RAW GRAPH JSON ===")
+                print(json.dumps(raw, indent=2, ensure_ascii=False))
 
-        # 5) mqtt publish (persistent connection)
-        if args.mqtt_publish and mqtt_pub is not None:
-            pub_raw, pub_filtered = resolve_publish_modes()
-            topic_raw, topic_filtered = mqtt_topics()
+            if args.print_filtered:
+                print("=== FILTERED GRAPH JSON (ESP32 compatible) ===")
+                print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
-            if pub_raw:
-                payload_raw = json_dumps_compact(raw)  # full API JSON
-                mqtt_pub.publish(topic_raw, payload_raw, retain=args.mqtt_retain, qos=args.mqtt_qos)
+            # 4) sync adapt offset based on measurement timestamp
+            fetch_offset_s = adapt_offset(
+                current_offset=fetch_offset_s,
+                meas_timestamp_str=cloud_ts_str,
+                tz=tz,
+                desired_lag_s=args.fetch_offset_target_lag,
+                gain=args.fetch_offset_gain,
+                max_step_s=args.fetch_offset_max_step,
+                offset_min_s=args.fetch_offset_min,
+                offset_max_s=args.fetch_offset_max,
+                logger=logger,
+            )
 
-            if pub_filtered:
-                payload_f = json_dumps_compact(filtered)  # ESP32-format
-                mqtt_pub.publish(topic_filtered, payload_f, retain=args.mqtt_retain, qos=args.mqtt_qos)
+            # 5) mqtt publish (persistent connection)
+            if args.mqtt_publish and mqtt_pub is not None:
+                pub_raw, pub_filtered = resolve_publish_modes()
+                topic_raw, topic_filtered = mqtt_topics()
 
-        return fetch_offset_s
+                if pub_raw:
+                    payload_raw = json_dumps_compact(raw)  # full API JSON
+                    mqtt_pub.publish(topic_raw, payload_raw, retain=args.mqtt_retain, qos=args.mqtt_qos)
+
+                if pub_filtered:
+                    payload_f = json_dumps_compact(filtered)  # ESP32-format
+                    mqtt_pub.publish(topic_filtered, payload_f, retain=args.mqtt_retain, qos=args.mqtt_qos)
+
+            # ok counters
+            health.last_fetch_ok = now_ts(tz)
+            health.fetch_ok_count += 1
+            health.last_error = ""
+
+            return fetch_offset_s
+
+        except Exception as ex:
+            # error counters
+            health.last_fetch_fail = now_ts(tz)
+            health.fetch_err_count += 1
+            health.last_error = str(ex)[:300]
+            raise
+
+        finally:
+            health.last_fetch_duration_ms = int((time.time() - t0) * 1000)
+            # publish health each cycle (ok or error)
+            try:
+                publish_health(fetch_offset_s)
+            except Exception as ex:
+                logger.warning("[health] publish failed: %s", ex)
 
     # single-shot
     if not args.loop:
