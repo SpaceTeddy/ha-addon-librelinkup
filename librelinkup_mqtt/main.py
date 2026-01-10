@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass
@@ -24,24 +25,66 @@ except Exception:
 
 
 # -----------------------------
-# Helpers
+# Logging (timestamp + levels)
 # -----------------------------
 
-def eprint(*a, **k):
-    print(*a, file=sys.stderr, **k)
+def _parse_log_level(s: str) -> int:
+    s = (s or "").strip().upper()
+    return {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "WARN": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }.get(s, logging.INFO)
+
+
+class TZFormatter(logging.Formatter):
+    """Formatter mit lokaler TZ (zoneinfo) + Millisekunden."""
+
+    def __init__(self, fmt: str, tz):
+        super().__init__(fmt=fmt, datefmt=None)
+        self._tz = tz
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=self._tz) if self._tz else datetime.fromtimestamp(record.created)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def setup_logger(log_level: str, tz):
+    logger = logging.getLogger("librelinkup")
+    logger.setLevel(_parse_log_level(log_level))
+    logger.handlers.clear()
+    logger.propagate = False
+
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(TZFormatter("%(asctime)s [%(levelname)s] %(message)s", tz))
+    logger.addHandler(h)
+
+    return logger
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 def json_dumps_compact(obj: Any) -> str:
     # garantiert JSON-konform (dumps wirft Exception, wenn nicht serialisierbar)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
+
 def now_ts(tz) -> datetime:
     return datetime.now(tz) if tz else datetime.now()
+
 
 def parse_libreview_ts(ts: str, tz) -> Optional[datetime]:
     # Example: "1/9/2026 10:41:01 AM"
@@ -52,6 +95,7 @@ def parse_libreview_ts(ts: str, tz) -> Optional[datetime]:
         return dt.replace(tzinfo=tz) if tz else dt
     except Exception:
         return None
+
 
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
     # next multiple of period + offset
@@ -72,6 +116,7 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+
 @dataclass
 class LoginResult:
     status: int
@@ -80,6 +125,7 @@ class LoginResult:
     token: str
     expires: int          # unix seconds
     account_id: str
+
 
 class LibreLinkUpClient:
     def __init__(
@@ -91,7 +137,7 @@ class LibreLinkUpClient:
         timeout_s: int = 15,
         verify_tls: bool = True,
         connection_close: bool = False,
-        debug: bool = False,
+        logger: Optional[logging.Logger] = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.auth_url = self.api_base + auth_path
@@ -100,8 +146,8 @@ class LibreLinkUpClient:
         self.timeout_s = timeout_s
         self.verify_tls = verify_tls
         self.connection_close = connection_close
-        self.debug = debug
         self.session = requests.Session()
+        self.log = logger or logging.getLogger("librelinkup")
 
     def _headers(self) -> Dict[str, str]:
         h = dict(DEFAULT_HEADERS)
@@ -111,8 +157,7 @@ class LibreLinkUpClient:
 
     def auth_user(self, email: str, password: str) -> LoginResult:
         payload = {"email": email, "password": password}
-        if self.debug:
-            eprint(f"[http] POST {self.auth_url}")
+        self.log.debug("[http] POST %s", self.auth_url)
 
         r = self.session.post(
             self.auth_url,
@@ -121,22 +166,35 @@ class LibreLinkUpClient:
             timeout=self.timeout_s,
             verify=self.verify_tls,
         )
-        if self.debug:
-            eprint(f"[http] status={r.status_code} len={len(r.content)}")
+
+        self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
         r.raise_for_status()
 
-        data = r.json()
-        status = int(data.get("status", -1))
-        user = (data.get("data") or {}).get("user") or {}
-        ticket = (data.get("data") or {}).get("authTicket") or {}
+        # Login-Response ist manchmal klein -> bei Fehlern: {"status":2,...}
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError(f"Login response is not JSON (status_code={r.status_code}, body={r.text[:200]!r})")
 
-        user_id = str(user.get("id", ""))
-        token = str(ticket.get("token", ""))
-        expires = int(ticket.get("expires", 0))
-        country = str(user.get("country", ""))
+        status = int(data.get("status", -1))
+        d = (data.get("data") or {})
+        user = d.get("user") or {}
+        ticket = d.get("authTicket") or {}
+
+        user_id = str(user.get("id", "")) if user else ""
+        token = str(ticket.get("token", "")) if ticket else ""
+        expires = int(ticket.get("expires", 0)) if ticket else 0
+        country = str(user.get("country", "")) if user else ""
 
         if not user_id or not token:
-            raise RuntimeError(f"Login response missing user_id/token (status={status})")
+            # besserer Fehlertext inkl. möglicher "error"/"message"
+            err = data.get("error") or data.get("message") or data.get("reason") or ""
+            body_short = json.dumps(data, ensure_ascii=False)[:300]
+            raise RuntimeError(
+                f"Login response missing user_id/token (status={status})"
+                + (f" error={err!r}" if err else "")
+                + f" body={body_short}"
+            )
 
         account_id = sha256_hex(user_id)
 
@@ -150,8 +208,7 @@ class LibreLinkUpClient:
         )
 
     def tou_user(self, token: str) -> Dict[str, Any]:
-        if self.debug:
-            eprint(f"[http] POST {self.tou_url}")
+        self.log.debug("[http] POST %s", self.tou_url)
 
         h = self._headers()
         h["Authorization"] = f"Bearer {token}"
@@ -163,16 +220,13 @@ class LibreLinkUpClient:
             timeout=self.timeout_s,
             verify=self.verify_tls,
         )
-        if self.debug:
-            eprint(f"[http] status={r.status_code} len={len(r.content)}")
+        self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
         r.raise_for_status()
         return r.json()
 
     def get_graph(self, user_id: str, token: str, account_id: str) -> Dict[str, Any]:
         url = self.api_base + self.graph_template.format(user_id=user_id)
-
-        if self.debug:
-            eprint(f"[http] GET {url}")
+        self.log.debug("[http] GET %s", url)
 
         h = self._headers()
         h["Authorization"] = f"Bearer {token}"
@@ -184,9 +238,7 @@ class LibreLinkUpClient:
             timeout=self.timeout_s,
             verify=self.verify_tls,
         )
-
-        if self.debug:
-            eprint(f"[http] status={r.status_code} len={len(r.content)}")
+        self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
 
         if r.status_code == 401:
             raise PermissionError("Unauthorized (401)")
@@ -275,7 +327,7 @@ def adapt_offset(
     max_step_s: float,
     offset_min_s: float,
     offset_max_s: float,
-    debug: bool,
+    logger: logging.Logger,
 ) -> float:
     meas_ts = parse_libreview_ts(meas_timestamp_str or "", tz)
     if meas_ts is None:
@@ -288,11 +340,10 @@ def adapt_offset(
     step = clamp(gain * err, -max_step_s, +max_step_s)
     new_offset = clamp(current_offset - step, offset_min_s, offset_max_s)
 
-    if debug:
-        eprint(
-            f"[sync] lag={lag_s:.2f}s desired={desired_lag_s:.2f}s err={err:.2f}s "
-            f"step={step:+.2f}s offset={current_offset:.2f}->{new_offset:.2f}"
-        )
+    logger.debug(
+        "[sync] lag=%.2fs desired=%.2fs err=%.2fs step=%+.2fs offset=%.2f->%.2f",
+        lag_s, desired_lag_s, err, step, current_offset, new_offset
+    )
     return new_offset
 
 
@@ -308,7 +359,7 @@ class MqttPublisher:
         user: str,
         password: str,
         keepalive: int,
-        debug: bool,
+        logger: logging.Logger,
     ):
         if mqtt is None:
             raise RuntimeError("paho-mqtt not installed. Try: pip install paho-mqtt")
@@ -318,10 +369,13 @@ class MqttPublisher:
         self.user = user
         self.password = password
         self.keepalive = keepalive
-        self.debug = debug
+        self.log = logger
 
         self._connected = False
+
+        # Du willst die DeprecationWarning erstmal behalten -> so lassen
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+
         if user:
             self.client.username_pw_set(user, password=password)
 
@@ -330,22 +384,17 @@ class MqttPublisher:
 
     def _on_connect(self, client, userdata, flags, rc):
         self._connected = (rc == 0)
-        if self.debug:
-            eprint(f"[mqtt] on_connect rc={rc} connected={self._connected}")
+        self.log.debug("[mqtt] on_connect rc=%s connected=%s", rc, self._connected)
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
-        if self.debug:
-            eprint(f"[mqtt] on_disconnect rc={rc}")
+        self.log.debug("[mqtt] on_disconnect rc=%s", rc)
 
     def connect(self):
-        if self.debug:
-            eprint(f"[mqtt] connect {self.host}:{self.port} user={self.user!r}")
+        self.log.info("[mqtt] connect %s:%s user=%r", self.host, self.port, self.user)
         self.client.connect(self.host, self.port, keepalive=self.keepalive)
-        # background network loop
         self.client.loop_start()
 
-        # kurz warten bis on_connect kommt
         t0 = time.time()
         while not self._connected and (time.time() - t0) < 5:
             time.sleep(0.05)
@@ -356,27 +405,20 @@ class MqttPublisher:
     def ensure_connected(self):
         if self._connected:
             return
-        # reconnect
-        if self.debug:
-            eprint("[mqtt] reconnecting…")
-        try:
-            self.client.reconnect()
-        except Exception:
-            # fallback: hard reconnect
-            try:
-                self.client.loop_stop()
-            except Exception:
-                pass
-            self.client = None
-            raise
+        self.log.warning("[mqtt] not connected -> reconnecting…")
+        self.client.reconnect()
+
+        # kurz warten
+        t0 = time.time()
+        while not self._connected and (time.time() - t0) < 5:
+            time.sleep(0.05)
+
+        if not self._connected:
+            raise RuntimeError("MQTT reconnect timeout")
 
     def publish(self, topic: str, payload: str, retain: bool, qos: int):
-        if not self._connected:
-            self.ensure_connected()
-
-        if self.debug:
-            eprint(f"[mqtt] publish topic={topic} retain={retain} qos={qos} bytes={len(payload)}")
-
+        self.ensure_connected()
+        self.log.debug("[mqtt] publish topic=%s retain=%s qos=%s bytes=%s", topic, retain, qos, len(payload))
         info = self.client.publish(topic, payload=payload, qos=qos, retain=retain)
         info.wait_for_publish(timeout=10)
 
@@ -401,16 +443,16 @@ class AuthCache:
     login: Optional[LoginResult] = None
     last_login_epoch: float = 0.0
 
+
 def token_is_valid(login: Optional[LoginResult], min_valid_for_s: int) -> bool:
     if not login:
         return False
-    # expires ist unix seconds (laut API)
     now = int(time.time())
     return (login.expires - now) > min_valid_for_s
 
 
 # -----------------------------
-# Main flow
+# Main
 # -----------------------------
 
 def main():
@@ -422,8 +464,9 @@ def main():
     p.add_argument("--email", required=True, help="LibreLinkUp email")
     p.add_argument("--password", required=True, help="LibreLinkUp password (quote it in the shell!)")
 
-    # output/debug
-    p.add_argument("--debug", action="store_true", help="Verbose debug logging to stderr")
+    # output/debug/logging
+    p.add_argument("--debug", action="store_true", help="Enable debug logging (kept for compatibility)")
+    p.add_argument("--log-level", default="INFO", help="Log level: DEBUG, INFO, WARNING, ERROR (default INFO)")
     p.add_argument("--print-raw", action="store_true", help="Print raw /graph JSON")
     p.add_argument("--print-filtered", action="store_true", help="Print ESP32-compatible filtered JSON")
 
@@ -468,19 +511,26 @@ def main():
     p.add_argument("--mqtt-topic-raw-suffix", default="data_raw", help="Raw topic suffix (default data_raw)")
     p.add_argument("--mqtt-topic-filtered-suffix", default="data", help="Filtered topic suffix (default data)")
 
-    p.add_argument("--mqtt-publish-raw", action="store_true", help="Publish raw JSON")
-    p.add_argument("--mqtt-publish-filtered", action="store_true", help="Publish filtered JSON")
+    p.add_argument("--mqtt-publish-raw", action="store_true", help="Publish raw JSON (full API JSON)")
+    p.add_argument("--mqtt-publish-filtered", action="store_true", help="Publish filtered JSON (ESP32-format)")
     p.add_argument("--mqtt-retain", action="store_true", help="MQTT retain flag")
     p.add_argument("--mqtt-qos", type=int, default=0, choices=[0, 1, 2], help="MQTT QoS (0/1/2)")
 
     args = p.parse_args()
 
+    # timezone
     tz = None
     if ZoneInfo is not None:
         try:
             tz = ZoneInfo(args.tz)
         except Exception:
             tz = None
+
+    # debug flag compatibility
+    if args.debug and (args.log_level or "").upper() == "INFO":
+        args.log_level = "DEBUG"
+
+    logger = setup_logger(args.log_level, tz)
 
     client = LibreLinkUpClient(
         api_base=args.api_base,
@@ -490,7 +540,7 @@ def main():
         timeout_s=args.timeout,
         verify_tls=not args.no_verify_tls,
         connection_close=args.connection_close,
-        debug=args.debug,
+        logger=logger,
     )
 
     # MQTT persistent setup (optional)
@@ -502,38 +552,34 @@ def main():
             user=args.mqtt_user,
             password=args.mqtt_password,
             keepalive=args.mqtt_keepalive,
-            debug=args.debug,
+            logger=logger,
         )
         mqtt_pub.connect()
 
     auth = AuthCache()
 
     def ensure_login() -> LoginResult:
-        # Reuse token while valid
         if token_is_valid(auth.login, args.token_min_valid):
             return auth.login  # type: ignore
 
-        if args.debug:
-            eprint("=== LOGIN (new/refresh) ===")
-
+        logger.info("=== LOGIN (new/refresh) ===")
         login = client.auth_user(args.email, args.password)
         auth.login = login
         auth.last_login_epoch = time.time()
 
-        if args.debug:
-            eprint(f"user_id        : {login.user_id}")
-            eprint(f"country        : {login.country}")
-            eprint(f"status         : {login.status}")
-            eprint(f"token (short)  : {login.token[:18]}…")
-            eprint(f"expires (unix) : {login.expires}")
-            eprint(f"account_id     : {login.account_id}")
+        logger.debug("user_id        : %s", login.user_id)
+        logger.debug("country        : %s", login.country)
+        logger.debug("status         : %s", login.status)
+        logger.debug("token (short)  : %s…", (login.token[:18] if login.token else ""))
+        logger.debug("expires (unix) : %s", login.expires)
+        logger.debug("account_id     : %s", login.account_id)
 
         if login.status == 4:
-            eprint("[info] ToU/consent required -> trying tou_user()")
+            logger.info("[info] ToU/consent required -> trying tou_user()")
             try:
                 client.tou_user(login.token)
             except Exception as ex:
-                eprint(f"[warn] tou_user failed: {ex}")
+                logger.warning("[warn] tou_user failed: %s", ex)
 
         return login
 
@@ -544,21 +590,26 @@ def main():
         topic_filtered = f"{base}/{mid}/{args.mqtt_topic_filtered_suffix}"
         return topic_raw, topic_filtered
 
+    def resolve_publish_modes() -> Tuple[bool, bool]:
+        """
+        Wenn der User explizit Flags setzt -> respektieren.
+        Wenn keine Flags gesetzt -> Default: raw=False, filtered=True (wie dein ESP32 Use-Case).
+        """
+        any_flag = bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
+        if any_flag:
+            return bool(args.mqtt_publish_raw), bool(args.mqtt_publish_filtered)
+        return False, True
+
     def one_cycle(fetch_offset_s: float) -> float:
         # 1) login reuse
         login = ensure_login()
 
         # 2) fetch graph (if 401 -> relogin once and retry)
-        if args.debug:
-            eprint("=== FETCH GRAPH ===")
-
-        raw: Dict[str, Any]
+        logger.debug("=== FETCH GRAPH ===")
         try:
             raw = client.get_graph(login.user_id, login.token, login.account_id)
         except PermissionError:
-            # token invalid -> relogin and retry once
-            if args.debug:
-                eprint("[auth] 401 -> relogin and retry once")
+            logger.warning("[auth] 401 -> relogin and retry once")
             auth.login = None
             login = ensure_login()
             raw = client.get_graph(login.user_id, login.token, login.account_id)
@@ -589,14 +640,12 @@ def main():
             max_step_s=args.fetch_offset_max_step,
             offset_min_s=args.fetch_offset_min,
             offset_max_s=args.fetch_offset_max,
-            debug=args.debug,
+            logger=logger,
         )
 
         # 5) mqtt publish (persistent connection)
         if args.mqtt_publish and mqtt_pub is not None:
-            pub_raw = args.mqtt_publish_raw or (not args.mqtt_publish_filterered_and_raw_flags_set(args))
-            pub_filtered = args.mqtt_publish_filtered or (not args.mqtt_publish_filterered_and_raw_flags_set(args))
-
+            pub_raw, pub_filtered = resolve_publish_modes()
             topic_raw, topic_filtered = mqtt_topics()
 
             if pub_raw:
@@ -609,25 +658,19 @@ def main():
 
         return fetch_offset_s
 
-    # helper: decide defaults if user didn't specify raw/filtered flags
-    def mqtt_publish_filterered_and_raw_flags_set(args) -> bool:
-        return bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
-
-    # attach helper into args namespace (so above can call it without extra state)
-    args.mqtt_publish_filterered_and_raw_flags_set = mqtt_publish_filterered_and_raw_flags_set  # type: ignore
-
     # single-shot
     if not args.loop:
-        _ = one_cycle(args.fetch_offset)
-        if mqtt_pub:
-            mqtt_pub.close()
-        print("✔ Done")
+        try:
+            _ = one_cycle(args.fetch_offset)
+            logger.info("✔ Done")
+        finally:
+            if mqtt_pub:
+                mqtt_pub.close()
         return
 
     # loop mode
     fetch_offset_s = float(args.fetch_offset)
-    eprint(f"[loop] interval={args.interval}s initial_offset={fetch_offset_s:.2f}s tz={args.tz}")
-
+    logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
     next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
 
     try:
@@ -638,8 +681,10 @@ def main():
 
             try:
                 fetch_offset_s = one_cycle(fetch_offset_s)
+            except KeyboardInterrupt:
+                raise
             except Exception as ex:
-                eprint(f"[error] cycle failed: {ex}")
+                logger.error("cycle failed: %s", ex)
 
             next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
     finally:

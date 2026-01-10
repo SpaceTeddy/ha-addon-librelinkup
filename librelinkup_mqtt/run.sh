@@ -29,6 +29,7 @@ PUBLISH_FILTERED="$(jq -r '.publish_filtered // true' "$OPTIONS")"
 RETAIN="$(jq -r '.mqtt_retain // true' "$OPTIONS")"
 QOS="$(jq -r '.mqtt_qos // 0' "$OPTIONS")"
 DEBUG="$(jq -r '.debug // false' "$OPTIONS")"
+LOG_LEVEL="$(jq -r '.log_level // "INFO"' "$OPTIONS")"
 
 # Build a real argv list (NO string building, NO eval, NO sh -c)
 set -- python3 /main.py \
@@ -38,6 +39,7 @@ set -- python3 /main.py \
   --interval "$INTERVAL" \
   --fetch-offset "$FETCH_OFFSET" \
   --tz "$TZ" \
+  --log-level "$LOG_LEVEL" \
   --mqtt-publish \
   --mqtt-host "$MQTT_HOST" \
   --mqtt-port "$MQTT_PORT" \
@@ -56,4 +58,5 @@ set -- python3 /main.py \
 [ -n "$MQTT_PASSWORD" ] && set -- "$@" --mqtt-password "$MQTT_PASSWORD"
 
 echo "[info] Starting LibreLinkUp MQTT add-on"
+echo "[info] log_level=$LOG_LEVEL debug=$DEBUG interval=${INTERVAL}s offset=${FETCH_OFFSET}s tz=$TZ"
 exec "$@"
