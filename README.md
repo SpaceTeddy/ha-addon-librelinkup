@@ -6,7 +6,6 @@ The focus is on:
 - Stable token/session reuse
 - Time-aligned fetching (offset + sync)
 - Clear logging with **timestamps & log levels**
-- Compatibility with existing **ESP32-based setups**
 
 ---
 
@@ -17,7 +16,7 @@ The focus is on:
 - 🔁 **Token reuse** (login only when required)
 - 📡 **Persistent MQTT connection**
 - 📦 Two data formats:
-  - **Filtered JSON** (ESP32-compatible, recommended)
+  - **Filtered JSON**
   - **Raw JSON** (full API response, optional)
 - 🧾 **Timestamped logging with log levels**
 - 🧪 CLI and add-on share the **same code base**
@@ -107,7 +106,7 @@ debug: false
 ### Publish
 | Option | Description |
 |------|-------------|
-| `publish_filtered` | ESP32-compatible JSON (recommended) |
+| `publish_filtered` |  |
 | `publish_raw` | Full API JSON (debug / analysis) |
 
 ### Logging
@@ -131,7 +130,7 @@ Example (`mqtt_base_topic=librelinkup`, `master_id=MASTER`):
 
 | Topic | Payload |
 |------|---------|
-| `librelinkup/MASTER/data` | Filtered JSON (ESP32 format) |
+| `librelinkup/MASTER/data` | Filtered JSON |
 | `librelinkup/MASTER/data_raw` | Raw API JSON (optional) |
 
 ---
