@@ -1,5 +1,5 @@
 name: LibreLinkUp MQTT
-version: "1.0.9"
+version: "1.0.10"
 slug: librelinkup_mqtt
 description: Fetch LibreLinkUp data and publish to MQTT (raw + filtered)
 url: https://github.com/SpaceTeddy/ha-addon-librelinkup
@@ -44,6 +44,9 @@ options:
   mqtt_retain: true
   mqtt_qos: 0
 
+  mqtt_publish_health: true
+  mqtt_health_retain: true
+
   debug: false
   log_level: "INFO"
 
@@ -66,6 +69,11 @@ schema:
   publish_filtered: bool
   mqtt_retain: bool
   mqtt_qos: int(0,2)
+
+  mqtt_publish_health: bool
+  mqtt_health_retain: bool
+
+  
 
   debug: bool
   log_level: list(DEBUG|INFO|WARNING|ERROR)
