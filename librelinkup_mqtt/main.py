@@ -78,7 +78,6 @@ def sha256_hex(s: str) -> str:
 
 
 def json_dumps_compact(obj: Any) -> str:
-    # garantiert JSON-konform (dumps wirft Exception, wenn nicht serialisierbar)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -105,8 +104,43 @@ def parse_libreview_ts(ts: str, tz) -> Optional[datetime]:
         return None
 
 
+def parse_libreview_ts_naive(ts: str) -> Optional[datetime]:
+    # Parse without timezone. Used for FactoryTimestamp-vs-Timestamp delta.
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%m/%d/%Y %I:%M:%S %p")
+    except Exception:
+        return None
+
+
+def compute_factory_offset(
+    ts_local: Optional[str],
+    ts_factory: Optional[str],
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str]]:
+    """
+    Compute offset between localized Timestamp and FactoryTimestamp.
+
+    Returns:
+      offset_s: seconds (local - factory)
+      offset_h: rounded hours
+      residual_s: abs(offset_s - offset_h*3600)
+      quality: "high" if residual<=120s else "low"
+    """
+    dl = parse_libreview_ts_naive(ts_local or "")
+    df = parse_libreview_ts_naive(ts_factory or "")
+    if not dl or not df:
+        return None, None, None, None
+
+    offset_s = int((dl - df).total_seconds())
+    offset_h = int(round(offset_s / 3600.0))
+    residual_s = abs(offset_s - offset_h * 3600)
+
+    quality = "high" if residual_s <= 120 else "low"
+    return offset_s, offset_h, residual_s, quality
+
+
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
-    # next multiple of period + offset
     base = (int(epoch_now) // period_s + 1) * period_s
     return base + offset_s
 
@@ -261,7 +295,7 @@ class LibreLinkUpClient:
 
 
 # -----------------------------
-# Filtering (ESP32 compatible)
+# Filtering (ESP32 compatible) + FactoryTimestamp
 # -----------------------------
 
 def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, Any]:
@@ -273,6 +307,10 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
     if graph_limit and isinstance(gdata, list):
         gdata = gdata[-graph_limit:]
 
+    gm = (conn.get("glucoseMeasurement") or {})
+    sensor = (conn.get("sensor") or {})
+    pd = (conn.get("patientDevice") or {})
+
     out = {
         "data": {
             "connection": {
@@ -281,22 +319,24 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
                 "targetLow": conn.get("targetLow"),
                 "targetHigh": conn.get("targetHigh"),
                 "sensor": {
-                    "deviceId": (conn.get("sensor") or {}).get("deviceId"),
-                    "sn": (conn.get("sensor") or {}).get("sn"),
-                    "a": (conn.get("sensor") or {}).get("a"),
+                    "deviceId": sensor.get("deviceId"),
+                    "sn": sensor.get("sn"),
+                    "a": sensor.get("a"),
                 },
                 "glucoseMeasurement": {
-                    "Timestamp": (conn.get("glucoseMeasurement") or {}).get("Timestamp"),
-                    "ValueInMgPerDl": (conn.get("glucoseMeasurement") or {}).get("ValueInMgPerDl"),
-                    "TrendArrow": (conn.get("glucoseMeasurement") or {}).get("TrendArrow"),
-                    "TrendMessage": (conn.get("glucoseMeasurement") or {}).get("TrendMessage"),
-                    "MeasurementColor": (conn.get("glucoseMeasurement") or {}).get("MeasurementColor"),
+                    # ✅ include FactoryTimestamp for timecode logic
+                    "FactoryTimestamp": gm.get("FactoryTimestamp"),
+                    "Timestamp": gm.get("Timestamp"),
+                    "ValueInMgPerDl": gm.get("ValueInMgPerDl"),
+                    "TrendArrow": gm.get("TrendArrow"),
+                    "TrendMessage": gm.get("TrendMessage"),
+                    "MeasurementColor": gm.get("MeasurementColor"),
                 },
                 "patientDevice": {
-                    "ll": (conn.get("patientDevice") or {}).get("ll"),
-                    "hl": (conn.get("patientDevice") or {}).get("hl"),
+                    "ll": pd.get("ll"),
+                    "hl": pd.get("hl"),
                     "fixedLowAlarmValues": {
-                        "mgdl": ((conn.get("patientDevice") or {}).get("fixedLowAlarmValues") or {}).get("mgdl")
+                        "mgdl": (pd.get("fixedLowAlarmValues") or {}).get("mgdl")
                     },
                 },
             },
@@ -319,9 +359,12 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
 
     if isinstance(gdata, list):
         for item in gdata:
+            it = (item or {})
             out["data"]["graphData"].append({
-                "Timestamp": (item or {}).get("Timestamp"),
-                "ValueInMgPerDl": (item or {}).get("ValueInMgPerDl"),
+                # ✅ include FactoryTimestamp also in graphData
+                "FactoryTimestamp": it.get("FactoryTimestamp"),
+                "Timestamp": it.get("Timestamp"),
+                "ValueInMgPerDl": it.get("ValueInMgPerDl"),
             })
 
     return out
@@ -393,7 +436,6 @@ class MqttPublisher:
         self._connected = False
         self.reconnects = 0
 
-        # Du willst die DeprecationWarning erstmal behalten -> so lassen
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 
         if user:
@@ -402,11 +444,9 @@ class MqttPublisher:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
 
-        # Topics
         self.topic_status = f"{self.base_topic}/{self.master_id}/status"
         self.topic_health = f"{self.base_topic}/{self.master_id}/health"
 
-        # LWT: offline retained
         lwt_payload = json_dumps_compact({
             "state": "offline",
             "ts_local": iso_now(self.tz),
@@ -418,7 +458,6 @@ class MqttPublisher:
         self._connected = (rc == 0)
         self.log.debug("[mqtt] on_connect rc=%s connected=%s", rc, self._connected)
 
-        # publish online retained
         if self._connected:
             try:
                 self.publish_json(self.topic_status, {
@@ -472,7 +511,6 @@ class MqttPublisher:
         self.publish_json(self.topic_health, obj, retain=retain, qos=qos)
 
     def close(self):
-        # optional: graceful offline (kein LWT, aber "clean shutdown")
         try:
             if self._connected:
                 self.publish_json(self.topic_status, {
@@ -531,6 +569,14 @@ class HealthState:
 
     last_cloud_ts: str = ""
     last_cloud_lag_s: Optional[float] = None
+
+    # ✅ Timecode info (FactoryTimestamp vs Timestamp)
+    last_factory_ts: str = ""
+    last_local_ts: str = ""
+    last_tz_offset_s: Optional[int] = None
+    last_tz_offset_h: Optional[int] = None
+    last_tz_offset_residual_s: Optional[int] = None
+    last_tz_offset_quality: str = ""
 
     relogin_count: int = 0
 
@@ -682,10 +728,6 @@ def main():
         return topic_raw, topic_filtered
 
     def resolve_publish_modes() -> Tuple[bool, bool]:
-        """
-        Wenn der User explizit Flags setzt -> respektieren.
-        Wenn keine Flags gesetzt -> Default: raw=False, filtered=True.
-        """
         any_flag = bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
         if any_flag:
             return bool(args.mqtt_publish_raw), bool(args.mqtt_publish_filtered)
@@ -722,6 +764,14 @@ def main():
                 "lag_s": health.last_cloud_lag_s,
                 "fetch_offset_s": float(fetch_offset_s),
                 "target_lag_s": float(args.fetch_offset_target_lag),
+
+                # ✅ Timecode/Offset derived from FactoryTimestamp vs Timestamp (DST/Winter included)
+                "local_ts": health.last_local_ts,
+                "factory_ts": health.last_factory_ts,
+                "tz_offset_s": health.last_tz_offset_s,
+                "tz_offset_h": health.last_tz_offset_h,
+                "tz_offset_residual_s": health.last_tz_offset_residual_s,
+                "tz_offset_quality": health.last_tz_offset_quality,
             },
 
             "auth": {
@@ -758,14 +808,22 @@ def main():
 
             filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
 
-            # cloud timestamp & lag
-            cloud_ts_str = (
-                ((filtered.get("data") or {}).get("connection") or {})
-                .get("glucoseMeasurement", {})
-                .get("Timestamp")
-            )
+            # Cloud timestamps (local + factory) + lag + offset
+            gm = (((filtered.get("data") or {}).get("connection") or {}).get("glucoseMeasurement") or {})
+            cloud_ts_str = gm.get("Timestamp")
+            cloud_factory_ts_str = gm.get("FactoryTimestamp")
+
             health.last_cloud_ts = cloud_ts_str or ""
             health.last_cloud_lag_s = compute_cloud_lag_s(cloud_ts_str, tz)
+
+            # ✅ compute offset between Timestamp and FactoryTimestamp (handles DST/Winter automatically)
+            off_s, off_h, resid_s, qual = compute_factory_offset(cloud_ts_str, cloud_factory_ts_str)
+            health.last_local_ts = cloud_ts_str or ""
+            health.last_factory_ts = cloud_factory_ts_str or ""
+            health.last_tz_offset_s = off_s
+            health.last_tz_offset_h = off_h
+            health.last_tz_offset_residual_s = resid_s
+            health.last_tz_offset_quality = qual or ""
 
             # 3) print
             if args.print_raw:
@@ -776,7 +834,7 @@ def main():
                 print("=== FILTERED GRAPH JSON (ESP32 compatible) ===")
                 print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
-            # 4) sync adapt offset based on measurement timestamp
+            # 4) sync adapt offset based on measurement timestamp (uses Timestamp, local tz for lag calc)
             fetch_offset_s = adapt_offset(
                 current_offset=fetch_offset_s,
                 meas_timestamp_str=cloud_ts_str,
@@ -810,7 +868,6 @@ def main():
             return fetch_offset_s
 
         except Exception as ex:
-            # error counters
             health.last_fetch_fail = now_ts(tz)
             health.fetch_err_count += 1
             health.last_error = str(ex)[:300]
@@ -818,7 +875,6 @@ def main():
 
         finally:
             health.last_fetch_duration_ms = int((time.time() - t0) * 1000)
-            # publish health each cycle (ok or error)
             try:
                 publish_health(fetch_offset_s)
             except Exception as ex:
