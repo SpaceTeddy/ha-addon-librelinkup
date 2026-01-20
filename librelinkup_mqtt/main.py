@@ -220,7 +220,7 @@ class LibreLinkUpClient:
             h["Connection"] = "close"
         return h
 
-        def auth_user(self, email: str, password: str) -> LoginResult:
+    def auth_user(self, email: str, password: str) -> LoginResult:
         """
         Login gegen LibreLinkUp.
         Falls die Cloud nur noch Region-Endpunkte akzeptiert, kommt ggf.:
