@@ -152,6 +152,22 @@ def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
     return (now_ts(tz) - dt).total_seconds()
 
 
+def region_to_base_url(region: str) -> str:
+    """
+    Mappt die Region (z.B. "de", "fr") auf den korrekten API-Host.
+    Sonderfälle können hier ergänzt werden.
+    """
+    if not region:
+        return "https://api.libreview.io"
+
+    r = region.strip().lower()
+    # Sonderfälle: 'de' und 'eu' -> api-de (dein Beobachtung)
+    if r in ("de", "eu"):
+        return "https://api-de.libreview.io"
+
+    # Standardfall
+    return f"https://api-{r}.libreview.io"
+
 # -----------------------------
 # LibreLinkUp minimal client
 # -----------------------------
@@ -204,55 +220,98 @@ class LibreLinkUpClient:
             h["Connection"] = "close"
         return h
 
-    def auth_user(self, email: str, password: str) -> LoginResult:
+        def auth_user(self, email: str, password: str) -> LoginResult:
+        """
+        Login gegen LibreLinkUp.
+        Falls die Cloud nur noch Region-Endpunkte akzeptiert, kommt ggf.:
+          {"status":0,"data":{"redirect":true,"region":"de"}}
+        Dann wird automatisch auf https://api-<region>.libreview.io umgestellt
+        und genau 1x erneut versucht (Loop-Schutz).
+        """
         payload = {"email": email, "password": password}
-        self.log.debug("[http] POST %s", self.auth_url)
 
-        r = self.session.post(
-            self.auth_url,
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout_s,
-            verify=self.verify_tls,
-        )
+        # max. 1 redirect retry
+        for attempt in (1, 2):
+            self.log.debug("[http] POST %s (attempt %d)", self.auth_url, attempt)
 
-        self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
-        r.raise_for_status()
-
-        try:
-            data = r.json()
-        except Exception:
-            raise RuntimeError(f"Login response is not JSON (status_code={r.status_code}, body={r.text[:200]!r})")
-
-        status = int(data.get("status", -1))
-        d = (data.get("data") or {})
-        user = d.get("user") or {}
-        ticket = d.get("authTicket") or {}
-
-        user_id = str(user.get("id", "")) if user else ""
-        token = str(ticket.get("token", "")) if ticket else ""
-        expires = int(ticket.get("expires", 0)) if ticket else 0
-        country = str(user.get("country", "")) if user else ""
-
-        if not user_id or not token:
-            err = data.get("error") or data.get("message") or data.get("reason") or ""
-            body_short = json.dumps(data, ensure_ascii=False)[:300]
-            raise RuntimeError(
-                f"Login response missing user_id/token (status={status})"
-                + (f" error={err!r}" if err else "")
-                + f" body={body_short}"
+            r = self.session.post(
+                self.auth_url,
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout_s,
+                verify=self.verify_tls,
             )
 
-        account_id = sha256_hex(user_id)
+            self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
+            r.raise_for_status()
 
-        return LoginResult(
-            status=status,
-            country=country,
-            user_id=user_id,
-            token=token,
-            expires=expires,
-            account_id=account_id,
-        )
+            try:
+                data = r.json()
+            except Exception:
+                raise RuntimeError(
+                    f"Login response is not JSON (status_code={r.status_code}, body={r.text[:200]!r})"
+                )
+
+            # --- Redirect / Region handling ---
+            d = (data.get("data") or {})
+            redirect = bool(d.get("redirect", False))
+            region = str(d.get("region", "") or "").strip()
+
+            # Wenn redirect=true, region vorhanden und wir sind im 1. Versuch:
+            if redirect and region and attempt == 1:
+                new_base = region_to_base_url(region).rstrip("/")
+                old_base = self.api_base.rstrip("/")
+
+                if new_base != old_base:
+                    self.log.info("[auth] redirect requested: region=%s -> api_base=%s", region, new_base)
+
+                    # Base + URLs neu setzen
+                    self.api_base = new_base
+                    self.auth_url = self.api_base + "/llu/auth/login"
+                    self.tou_url = self.api_base + self.tou_url[self.tou_url.find("/llu/"):]  # keep path
+                    # graph_template bleibt nur Template, url wird in get_graph gebaut
+
+                    # Retry (2. Loop iteration)
+                    continue
+
+                # Loop-Schutz: redirect auf gleichen host
+                self.log.warning("[auth] redirect loop detected (region=%s base=%s)", region, new_base)
+                body_short = json.dumps(data, ensure_ascii=False)[:300]
+                raise RuntimeError(f"Redirect loop detected: body={body_short}")
+
+            # --- Normaler Login-Pfad ---
+            status = int(data.get("status", -1))
+            user = d.get("user") or {}
+            ticket = d.get("authTicket") or {}
+
+            user_id = str(user.get("id", "")) if user else ""
+            token = str(ticket.get("token", "")) if ticket else ""
+            expires = int(ticket.get("expires", 0)) if ticket else 0
+            country = str(user.get("country", "")) if user else ""
+
+            if not user_id or not token:
+                err = data.get("error") or data.get("message") or data.get("reason") or ""
+                body_short = json.dumps(data, ensure_ascii=False)[:300]
+                raise RuntimeError(
+                    f"Login response missing user_id/token (status={status})"
+                    + (f" error={err!r}" if err else "")
+                    + f" body={body_short}"
+                )
+
+            account_id = sha256_hex(user_id)
+
+            return LoginResult(
+                status=status,
+                country=country,
+                user_id=user_id,
+                token=token,
+                expires=expires,
+                account_id=account_id,
+            )
+
+        # Sollte nie erreicht werden
+        raise RuntimeError("Login failed after redirect retry")
+
 
     def tou_user(self, token: str) -> Dict[str, Any]:
         self.log.debug("[http] POST %s", self.tou_url)
