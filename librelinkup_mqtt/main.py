@@ -142,31 +142,30 @@ def compute_factory_offset(
 
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
     """
-    Berechnet den nächsten Laufzeitpunkt so, dass (next_run % period_s) == offset_s
-    — erlaubt Ausführung noch in der aktuellen Periode, falls offset_s dort noch in Zukunft liegt.
-    Zusätzlich Sicherheits-Clamps: offset_s < period_s.
+    Berechnet den nächsten Laufzeitpunkt so, dass (next_run % period_s) == offset_s.
+    Erlaubt Ausführung noch in der aktuellen Periode, falls offset dort noch in Zukunft liegt.
+    Stellt außerdem sicher, dass offset < period_s-1 (Sicherheitsclamp).
     """
-    # safety: normalisiere offset in gültigen Bereich [0, period_s-1]
+    # sanity: float konvertieren
     try:
         offset = float(offset_s)
     except Exception:
         offset = 0.0
 
-    # ensure offset is strictly less than the period (leave at most 1s margin)
+    # safety clamp: offset darf nicht >= period_s-1
     if offset >= period_s - 1:
         offset = max(0.0, period_s - 1.0)
 
-    # compute base of current period (floor)
+    # Basis der aktuellen Periode (floor)
     period_base = (int(epoch_now) // period_s) * period_s
     candidate = period_base + offset
 
-    # if candidate already passed (or is effectively now), schedule in next period
+    # Wenn candidate noch in der Zukunft (innerhalb derselben Periode), nimm ihn.
+    # Ansonsten nimm candidate + period_s (nächste Periode).
     if candidate <= epoch_now:
         candidate += period_s
 
     return candidate
-
-
 
 def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
     dt = parse_libreview_ts(cloud_ts_str or "", tz)
@@ -977,6 +976,7 @@ def main():
         while True:
             sleep_s = next_run - time.time()
             if sleep_s > 0:
+                logger.debug("[schedule] next_run=%s sleep=%.3fs offset=%.2f", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run)), sleep_s, fetch_offset_s)
                 time.sleep(sleep_s)
 
             try:
