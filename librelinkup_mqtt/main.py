@@ -140,33 +140,6 @@ def compute_factory_offset(
     return offset_s, offset_h, residual_s, quality
 
 
-def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
-    """
-    Berechnet den nächsten Laufzeitpunkt so, dass (next_run % period_s) == offset_s.
-    Erlaubt Ausführung noch in der aktuellen Periode, falls offset dort noch in Zukunft liegt.
-    Stellt außerdem sicher, dass offset < period_s-1 (Sicherheitsclamp).
-    """
-    # sanity: float konvertieren
-    try:
-        offset = float(offset_s)
-    except Exception:
-        offset = 0.0
-
-    # safety clamp: offset darf nicht >= period_s-1
-    if offset >= period_s - 1:
-        offset = max(0.0, period_s - 1.0)
-
-    # Basis der aktuellen Periode (floor)
-    period_base = (int(epoch_now) // period_s) * period_s
-    candidate = period_base + offset
-
-    # Wenn candidate noch in der Zukunft (innerhalb derselben Periode), nimm ihn.
-    # Ansonsten nimm candidate + period_s (nächste Periode).
-    if candidate <= epoch_now:
-        candidate += period_s
-
-    return candidate
-
 def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
     dt = parse_libreview_ts(cloud_ts_str or "", tz)
     if not dt:
@@ -189,6 +162,7 @@ def region_to_base_url(region: str) -> str:
 
     # Standardfall
     return f"https://api-{r}.libreview.io"
+
 
 # -----------------------------
 # LibreLinkUp minimal client
@@ -251,11 +225,11 @@ class LibreLinkUpClient:
         und genau 1x erneut versucht (Loop-Schutz).
         """
         payload = {"email": email, "password": password}
-    
+
         # max. 1 redirect retry
         for attempt in (1, 2):
             self.log.debug("[http] POST %s (attempt %d)", self.auth_url, attempt)
-    
+
             r = self.session.post(
                 self.auth_url,
                 headers=self._headers(),
@@ -263,51 +237,51 @@ class LibreLinkUpClient:
                 timeout=self.timeout_s,
                 verify=self.verify_tls,
             )
-    
+
             self.log.debug("[http] status=%s len=%s", r.status_code, len(r.content))
             r.raise_for_status()
-    
+
             try:
                 data = r.json()
             except Exception:
                 raise RuntimeError(
                     f"Login response is not JSON (status_code={r.status_code}, body={r.text[:200]!r})"
                 )
-    
+
             # --- Redirect / Region handling ---
             d = (data.get("data") or {})
             redirect = bool(d.get("redirect", False))
             region = str(d.get("region", "") or "").strip()
-    
+
             if redirect and region and attempt == 1:
                 new_base = region_to_base_url(region).rstrip("/")
                 old_base = self.api_base.rstrip("/")
-    
+
                 if new_base != old_base:
                     self.log.info("[auth] redirect requested: region=%s -> api_base=%s", region, new_base)
-    
+
                     # Base + URLs neu setzen
                     self.api_base = new_base
                     self.auth_url = self.api_base + "/llu/auth/login"
                     self.tou_url = self.api_base + "/llu/user/consent"
-    
+
                     # Retry (2. Versuch)
                     continue
-    
+
                 # Loop-Schutz: redirect auf gleichen host
                 body_short = json.dumps(data, ensure_ascii=False)[:300]
                 raise RuntimeError(f"Redirect loop detected: body={body_short}")
-    
+
             # --- Normaler Login-Pfad ---
             status = int(data.get("status", -1))
             user = d.get("user") or {}
             ticket = d.get("authTicket") or {}
-    
+
             user_id = str(user.get("id", "")) if user else ""
             token = str(ticket.get("token", "")) if ticket else ""
             expires = int(ticket.get("expires", 0)) if ticket else 0
             country = str(user.get("country", "")) if user else ""
-    
+
             if not user_id or not token:
                 err = data.get("error") or data.get("message") or data.get("reason") or ""
                 body_short = json.dumps(data, ensure_ascii=False)[:300]
@@ -316,9 +290,9 @@ class LibreLinkUpClient:
                     + (f" error={err!r}" if err else "")
                     + f" body={body_short}"
                 )
-    
+
             account_id = sha256_hex(user_id)
-    
+
             return LoginResult(
                 status=status,
                 country=country,
@@ -327,9 +301,8 @@ class LibreLinkUpClient:
                 expires=expires,
                 account_id=account_id,
             )
-    
-        raise RuntimeError("Login failed after redirect retry")
 
+        raise RuntimeError("Login failed after redirect retry")
 
     def tou_user(self, token: str) -> Dict[str, Any]:
         self.log.debug("[http] POST %s", self.tou_url)
@@ -401,7 +374,6 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
                     "a": sensor.get("a"),
                 },
                 "glucoseMeasurement": {
-                    # ✅ include FactoryTimestamp for timecode logic
                     "FactoryTimestamp": gm.get("FactoryTimestamp"),
                     "Timestamp": gm.get("Timestamp"),
                     "ValueInMgPerDl": gm.get("ValueInMgPerDl"),
@@ -438,7 +410,6 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
         for item in gdata:
             it = (item or {})
             out["data"]["graphData"].append({
-                # ✅ include FactoryTimestamp also in graphData
                 "FactoryTimestamp": it.get("FactoryTimestamp"),
                 "Timestamp": it.get("Timestamp"),
                 "ValueInMgPerDl": it.get("ValueInMgPerDl"),
@@ -453,8 +424,7 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
 
 def adapt_offset(
     current_offset: float,
-    meas_timestamp_str: Optional[str],
-    tz,
+    lag_s: Optional[float],
     desired_lag_s: float,
     gain: float,
     max_step_s: float,
@@ -462,14 +432,14 @@ def adapt_offset(
     offset_max_s: float,
     logger: logging.Logger,
 ) -> float:
-    meas_ts = parse_libreview_ts(meas_timestamp_str or "", tz)
-    if meas_ts is None:
+    """
+    Optional: adapt offset based on observed cloud lag.
+    With measurement-based scheduling, this is mainly a fine-tuning tool.
+    """
+    if lag_s is None:
         return current_offset
 
-    now = now_ts(tz)
-    lag_s = (now - meas_ts).total_seconds()
     err = lag_s - desired_lag_s
-
     step = clamp(gain * err, -max_step_s, +max_step_s)
     new_offset = clamp(current_offset - step, offset_min_s, offset_max_s)
 
@@ -513,6 +483,7 @@ class MqttPublisher:
         self._connected = False
         self.reconnects = 0
 
+        # keep current API for compatibility with your environment
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 
         if user:
@@ -647,7 +618,7 @@ class HealthState:
     last_cloud_ts: str = ""
     last_cloud_lag_s: Optional[float] = None
 
-    # ✅ Timecode info (FactoryTimestamp vs Timestamp)
+    # Timecode info (FactoryTimestamp vs Timestamp)
     last_factory_ts: str = ""
     last_local_ts: str = ""
     last_tz_offset_s: Optional[int] = None
@@ -657,6 +628,9 @@ class HealthState:
 
     relogin_count: int = 0
 
+    # last measurement dt (parsed)
+    last_meas_dt: Optional[datetime] = None
+
 
 # -----------------------------
 # Main
@@ -664,7 +638,7 @@ class HealthState:
 
 def main():
     p = argparse.ArgumentParser(
-        description="LibreLinkUp CLI: reuse token/session + optional MQTT persistent publish, ESP32-like filtered JSON + sync offset."
+        description="LibreLinkUp MQTT add-on: token reuse + persistent MQTT publish + filtered JSON + measurement-based scheduler."
     )
 
     # credentials
@@ -691,14 +665,17 @@ def main():
 
     # loop/sync
     p.add_argument("--loop", action="store_true", help="Run forever, fetching periodically")
-    p.add_argument("--interval", type=int, default=60, help="Fetch interval seconds (default 60)")
+    p.add_argument("--interval", type=int, default=60, help="Fallback interval seconds (default 60)")
 
-    p.add_argument("--fetch-offset", type=float, default=5.0, help="Initial fetch offset seconds (default 5)")
+    p.add_argument("--fetch-offset", type=float, default=5.0, help="Initial fallback offset seconds (default 5)")
     p.add_argument("--fetch-offset-target-lag", type=float, default=5.0, help="Target lag seconds vs measurement timestamp (default 5)")
+
+    # adaptive tuning (optional)
     p.add_argument("--fetch-offset-min", type=float, default=1.0, help="Min adaptive offset (default 1)")
     p.add_argument("--fetch-offset-max", type=float, default=20.0, help="Max adaptive offset (default 20)")
     p.add_argument("--fetch-offset-gain", type=float, default=0.3, help="Adaptive gain (default 0.3)")
-    p.add_argument("--fetch-offset-max-step", type=float, default=1.0, help="Max offset change per loop in seconds (default 1.0)")
+    p.add_argument("--fetch-offset-max-step", type=float, default=1.0, help="Max offset change per cycle (default 1.0)")
+
     p.add_argument("--tz", default="Europe/Berlin", help="Timezone for local comparison (default Europe/Berlin)")
 
     # token reuse
@@ -723,9 +700,9 @@ def main():
     p.add_argument("--mqtt-retain", action="store_true", help="MQTT retain flag")
     p.add_argument("--mqtt-qos", type=int, default=0, choices=[0, 1, 2], help="MQTT QoS (0/1/2)")
 
-    # Health publishing toggle (optional)
-    p.add_argument("--mqtt-publish-health", action="store_true", help="Publish health JSON to .../health (default on in addon)")
-    p.add_argument("--mqtt-health-retain", action="store_true", help="Retain health topic (default off unless set)")
+    # Health publishing toggle
+    p.add_argument("--mqtt-publish-health", action="store_true", help="Publish health JSON to .../health")
+    p.add_argument("--mqtt-health-retain", action="store_true", help="Retain health topic")
 
     args = p.parse_args()
 
@@ -742,6 +719,11 @@ def main():
         args.log_level = "DEBUG"
 
     logger = setup_logger(args.log_level, tz)
+
+    # basic sanity
+    if args.interval <= 0:
+        logger.warning("[cfg] interval=%s invalid, forcing 60", args.interval)
+        args.interval = 60
 
     client = LibreLinkUpClient(
         api_base=args.api_base,
@@ -841,8 +823,8 @@ def main():
                 "lag_s": health.last_cloud_lag_s,
                 "fetch_offset_s": float(fetch_offset_s),
                 "target_lag_s": float(args.fetch_offset_target_lag),
+                "meas_dt": iso_dt(health.last_meas_dt),
 
-                # ✅ Timecode/Offset derived from FactoryTimestamp vs Timestamp (DST/Winter included)
                 "local_ts": health.last_local_ts,
                 "factory_ts": health.last_factory_ts,
                 "tz_offset_s": health.last_tz_offset_s,
@@ -864,9 +846,15 @@ def main():
 
         mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
 
-    def one_cycle(fetch_offset_s: float) -> float:
+    def one_cycle(fetch_offset_s: float) -> Tuple[float, Optional[datetime]]:
+        """
+        Executes one fetch/publish cycle.
+        Returns: (updated_fetch_offset_s, measurement_datetime)
+        """
         health.last_fetch_start = now_ts(tz)
         t0 = time.time()
+
+        meas_dt: Optional[datetime] = None
 
         try:
             # 1) login reuse
@@ -885,15 +873,18 @@ def main():
 
             filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
 
-            # Cloud timestamps (local + factory) + lag + offset
+            # Cloud timestamps
             gm = (((filtered.get("data") or {}).get("connection") or {}).get("glucoseMeasurement") or {})
             cloud_ts_str = gm.get("Timestamp")
             cloud_factory_ts_str = gm.get("FactoryTimestamp")
 
             health.last_cloud_ts = cloud_ts_str or ""
+            health.last_meas_dt = parse_libreview_ts(cloud_ts_str or "", tz)
+            meas_dt = health.last_meas_dt
+
             health.last_cloud_lag_s = compute_cloud_lag_s(cloud_ts_str, tz)
 
-            # ✅ compute offset between Timestamp and FactoryTimestamp (handles DST/Winter automatically)
+            # compute offset between Timestamp and FactoryTimestamp
             off_s, off_h, resid_s, qual = compute_factory_offset(cloud_ts_str, cloud_factory_ts_str)
             health.last_local_ts = cloud_ts_str or ""
             health.last_factory_ts = cloud_factory_ts_str or ""
@@ -902,7 +893,7 @@ def main():
             health.last_tz_offset_residual_s = resid_s
             health.last_tz_offset_quality = qual or ""
 
-            # 3) print
+            # print
             if args.print_raw:
                 print("=== RAW GRAPH JSON ===")
                 print(json.dumps(raw, indent=2, ensure_ascii=False))
@@ -911,11 +902,10 @@ def main():
                 print("=== FILTERED GRAPH JSON (ESP32 compatible) ===")
                 print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
-            # 4) sync adapt offset based on measurement timestamp (uses Timestamp, local tz for lag calc)
+            # adapt (optional fine-tuning)
             fetch_offset_s = adapt_offset(
                 current_offset=fetch_offset_s,
-                meas_timestamp_str=cloud_ts_str,
-                tz=tz,
+                lag_s=health.last_cloud_lag_s,
                 desired_lag_s=args.fetch_offset_target_lag,
                 gain=args.fetch_offset_gain,
                 max_step_s=args.fetch_offset_max_step,
@@ -924,7 +914,7 @@ def main():
                 logger=logger,
             )
 
-            # 5) mqtt publish (persistent connection)
+            # mqtt publish (persistent connection)
             if args.mqtt_publish and mqtt_pub is not None:
                 pub_raw, pub_filtered = resolve_publish_modes()
                 topic_raw, topic_filtered = mqtt_topics()
@@ -942,7 +932,7 @@ def main():
             health.fetch_ok_count += 1
             health.last_error = ""
 
-            return fetch_offset_s
+            return fetch_offset_s, meas_dt
 
         except Exception as ex:
             health.last_fetch_fail = now_ts(tz)
@@ -960,33 +950,63 @@ def main():
     # single-shot
     if not args.loop:
         try:
-            _ = one_cycle(args.fetch_offset)
+            _fetch_offset_s, _meas_dt = one_cycle(args.fetch_offset)
             logger.info("✔ Done")
         finally:
             if mqtt_pub:
                 mqtt_pub.close()
         return
 
-    # loop mode
+    # -----------------------------
+    # Loop mode (measurement-based scheduling)
+    # -----------------------------
     fetch_offset_s = float(args.fetch_offset)
-    logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
-    next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
+    logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s target_lag=%.2fs",
+                args.interval, fetch_offset_s, args.tz, float(args.fetch_offset_target_lag))
+
+    # first run: now + initial offset
+    next_run = time.time() + fetch_offset_s
 
     try:
         while True:
             sleep_s = next_run - time.time()
             if sleep_s > 0:
-                logger.debug("[schedule] next_run=%s sleep=%.3fs offset=%.2f", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run)), sleep_s, fetch_offset_s)
                 time.sleep(sleep_s)
 
             try:
-                fetch_offset_s = one_cycle(fetch_offset_s)
+                fetch_offset_s, meas_dt = one_cycle(fetch_offset_s)
             except KeyboardInterrupt:
                 raise
             except Exception as ex:
                 logger.error("cycle failed: %s", ex)
+                meas_dt = None
 
-            next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
+            # schedule next run:
+            # Preferred: measurement timestamp + target lag
+            now_e = time.time()
+            target_lag = float(args.fetch_offset_target_lag)
+
+            if meas_dt is not None:
+                target = meas_dt.timestamp() + target_lag
+
+                # If target is too close or already in the past, fallback to now + interval
+                if target <= now_e + 0.5:
+                    next_run = now_e + args.interval
+                    logger.debug("[schedule] meas=%s target=%.3f is past/too-soon -> fallback next_run=%s",
+                                 meas_dt.isoformat(),
+                                 target,
+                                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run)))
+                else:
+                    next_run = target
+                    logger.debug("[schedule] meas=%s -> next_run=%s (target_lag=%.2fs)",
+                                 meas_dt.isoformat(),
+                                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run)),
+                                 target_lag)
+            else:
+                next_run = now_e + args.interval
+                logger.debug("[schedule] no meas_dt -> fallback next_run=%s",
+                             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run)))
+
     finally:
         if mqtt_pub:
             mqtt_pub.close()
