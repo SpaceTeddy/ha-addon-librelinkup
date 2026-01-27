@@ -141,18 +141,9 @@ def compute_factory_offset(
 
 
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
-    """
-    Returns the next timestamp >= now such that (timestamp % period_s) == offset_s (modulo period).
-    Allows scheduling inside the current period if offset is still in the future.
-    """
-    period_base = (int(epoch_now) // period_s) * period_s
-    candidate = period_base + offset_s
+    base = (int(epoch_now) // period_s + 1) * period_s
+    return base + offset_s
 
-    # If candidate already passed or equals now, advance to next period
-    if candidate <= epoch_now:
-        candidate += period_s
-
-    return candidate
 
 def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
     dt = parse_libreview_ts(cloud_ts_str or "", tz)
@@ -954,39 +945,28 @@ def main():
                 mqtt_pub.close()
         return
 
-        # loop mode (robuster, inkrementeller Scheduler)
-        fetch_offset_s = float(args.fetch_offset)
-        logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
-    
-        # initial next_run: schedule first run at now + fetch_offset_s (so first run happens soon)
-        next_run = time.time() + fetch_offset_s
-    
-        try:
-            while True:
-                sleep_s = next_run - time.time()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-    
-                try:
-                    fetch_offset_s = one_cycle(fetch_offset_s)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as ex:
-                    logger.error("cycle failed: %s", ex)
-    
-                # incremental advance: keep a fixed period relative to the planned times
-                next_run += args.interval
-    
-                # If we're behind schedule (e.g. one_cycle took too long), skip missed intervals
-                if next_run <= time.time():
-                    missed = int((time.time() - next_run) // args.interval) + 1
-                    logger.warning("[loop] behind schedule, skipping %d intervals to catch up", missed)
-                    next_run += missed * args.interval
-    
-        finally:
-            if mqtt_pub:
-                mqtt_pub.close()
+    # loop mode
+    fetch_offset_s = float(args.fetch_offset)
+    logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
+    next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
 
+    try:
+        while True:
+            sleep_s = next_run - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+            try:
+                fetch_offset_s = one_cycle(fetch_offset_s)
+            except KeyboardInterrupt:
+                raise
+            except Exception as ex:
+                logger.error("cycle failed: %s", ex)
+
+            next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
+    finally:
+        if mqtt_pub:
+            mqtt_pub.close()
 
 
 if __name__ == "__main__":
