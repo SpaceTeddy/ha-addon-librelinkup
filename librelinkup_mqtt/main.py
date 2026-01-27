@@ -141,8 +141,31 @@ def compute_factory_offset(
 
 
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
-    base = (int(epoch_now) // period_s + 1) * period_s
-    return base + offset_s
+    """
+    Berechnet den nächsten Laufzeitpunkt so, dass (next_run % period_s) == offset_s
+    — erlaubt Ausführung noch in der aktuellen Periode, falls offset_s dort noch in Zukunft liegt.
+    Zusätzlich Sicherheits-Clamps: offset_s < period_s.
+    """
+    # safety: normalisiere offset in gültigen Bereich [0, period_s-1]
+    try:
+        offset = float(offset_s)
+    except Exception:
+        offset = 0.0
+
+    # ensure offset is strictly less than the period (leave at most 1s margin)
+    if offset >= period_s - 1:
+        offset = max(0.0, period_s - 1.0)
+
+    # compute base of current period (floor)
+    period_base = (int(epoch_now) // period_s) * period_s
+    candidate = period_base + offset
+
+    # if candidate already passed (or is effectively now), schedule in next period
+    if candidate <= epoch_now:
+        candidate += period_s
+
+    return candidate
+
 
 
 def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
