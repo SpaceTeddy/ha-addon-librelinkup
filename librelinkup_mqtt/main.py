@@ -954,28 +954,39 @@ def main():
                 mqtt_pub.close()
         return
 
-    # loop mode
-    fetch_offset_s = float(args.fetch_offset)
-    logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
-    next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
+        # loop mode (robuster, inkrementeller Scheduler)
+        fetch_offset_s = float(args.fetch_offset)
+        logger.info("[loop] interval=%ss initial_offset=%.2fs tz=%s", args.interval, fetch_offset_s, args.tz)
+    
+        # initial next_run: schedule first run at now + fetch_offset_s (so first run happens soon)
+        next_run = time.time() + fetch_offset_s
+    
+        try:
+            while True:
+                sleep_s = next_run - time.time()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+    
+                try:
+                    fetch_offset_s = one_cycle(fetch_offset_s)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as ex:
+                    logger.error("cycle failed: %s", ex)
+    
+                # incremental advance: keep a fixed period relative to the planned times
+                next_run += args.interval
+    
+                # If we're behind schedule (e.g. one_cycle took too long), skip missed intervals
+                if next_run <= time.time():
+                    missed = int((time.time() - next_run) // args.interval) + 1
+                    logger.warning("[loop] behind schedule, skipping %d intervals to catch up", missed)
+                    next_run += missed * args.interval
+    
+        finally:
+            if mqtt_pub:
+                mqtt_pub.close()
 
-    try:
-        while True:
-            sleep_s = next_run - time.time()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-            try:
-                fetch_offset_s = one_cycle(fetch_offset_s)
-            except KeyboardInterrupt:
-                raise
-            except Exception as ex:
-                logger.error("cycle failed: %s", ex)
-
-            next_run = align_next_run(time.time(), args.interval, fetch_offset_s)
-    finally:
-        if mqtt_pub:
-            mqtt_pub.close()
 
 
 if __name__ == "__main__":
