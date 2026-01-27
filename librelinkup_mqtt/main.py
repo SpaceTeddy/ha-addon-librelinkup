@@ -141,9 +141,18 @@ def compute_factory_offset(
 
 
 def align_next_run(epoch_now: float, period_s: int, offset_s: float) -> float:
-    base = (int(epoch_now) // period_s + 1) * period_s
-    return base + offset_s
+    """
+    Returns the next timestamp >= now such that (timestamp % period_s) == offset_s (modulo period).
+    Allows scheduling inside the current period if offset is still in the future.
+    """
+    period_base = (int(epoch_now) // period_s) * period_s
+    candidate = period_base + offset_s
 
+    # If candidate already passed or equals now, advance to next period
+    if candidate <= epoch_now:
+        candidate += period_s
+
+    return candidate
 
 def compute_cloud_lag_s(cloud_ts_str: Optional[str], tz) -> Optional[float]:
     dt = parse_libreview_ts(cloud_ts_str or "", tz)
