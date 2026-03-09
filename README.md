@@ -55,6 +55,7 @@ password: "myPassword#withSpecialChars"
 
 interval: 60
 fetch_offset: 5.0
+fetch_offset_target_lag: 5.0
 tz: "Europe/Berlin"
 
 mqtt_host: "core-mosquitto"
@@ -68,6 +69,8 @@ publish_raw: false
 publish_filtered: true
 mqtt_retain: true
 mqtt_qos: 0
+mqtt_publish_on_change: true
+mqtt_force_publish_seconds: 0
 
 log_level: INFO
 debug: false
@@ -89,6 +92,7 @@ debug: false
 | `password` | LibreLinkUp password |
 | `interval` | Fetch interval in seconds |
 | `fetch_offset` | Offset in seconds after app upload |
+| `fetch_offset_target_lag` | Desired lag in seconds after new cloud measurement |
 | `tz` | Timezone for timestamp comparison |
 
 ### MQTT
@@ -102,6 +106,8 @@ debug: false
 | `master_id` | Instance / device identifier |
 | `mqtt_retain` | MQTT retain flag |
 | `mqtt_qos` | QoS level (0–2) |
+| `mqtt_publish_on_change` | Publish only on new `FactoryTimestamp` (reduces duplicate messages) |
+| `mqtt_force_publish_seconds` | Force republish after N seconds even if unchanged (`0` = disabled) |
 
 ### Publish
 | Option | Description |

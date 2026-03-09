@@ -577,6 +577,7 @@ class HealthState:
     last_meas_epoch: Optional[float] = None
 
     relogin_count: int = 0
+    last_publish_reason: str = ""
 
 
 # -----------------------------
@@ -648,6 +649,10 @@ def main():
     p.add_argument("--mqtt-publish-filtered", action="store_true", help="Publish filtered JSON")
     p.add_argument("--mqtt-retain", action="store_true", help="MQTT retain flag")
     p.add_argument("--mqtt-qos", type=int, default=0, choices=[0, 1, 2], help="MQTT QoS (0/1/2)")
+    p.add_argument("--mqtt-publish-on-change", action="store_true",
+                   help="Publish only when measurement timestamp changes (recommended)")
+    p.add_argument("--mqtt-force-publish-seconds", type=float, default=0.0,
+                   help="Force republish after this many seconds even if unchanged (0=disabled)")
 
     # Health publishing
     p.add_argument("--mqtt-publish-health", action="store_true", help="Publish health JSON to .../health")
@@ -701,6 +706,10 @@ def main():
     # Scheduler state (epoch-based)
     last_meas_epoch: Optional[float] = None
     last_meas_changed_epoch: float = time.time()
+    last_published_meas_epoch: Optional[float] = None
+    last_filtered_payload_sig: str = ""
+    last_raw_payload_sig: str = ""
+    last_publish_epoch: float = 0.0
 
     def ensure_login() -> LoginResult:
         if token_is_valid(auth.login, args.token_min_valid):
@@ -793,10 +802,33 @@ def main():
             "mqtt": {
                 "connected": bool(mqtt_pub._connected),
                 "reconnects": int(mqtt_pub.reconnects),
+                "last_publish_reason": health.last_publish_reason,
             }
         }
 
         mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
+
+    def should_publish(payload: str, meas_epoch: Optional[float], payload_sig_last: str) -> Tuple[bool, str, str]:
+        sig = sha256_hex(payload)
+        if not args.mqtt_publish_on_change:
+            return True, "always", sig
+
+        now_e = time.time()
+        if last_publish_epoch <= 0:
+            return True, "first", sig
+
+        if meas_epoch is not None:
+            if last_published_meas_epoch is None or meas_epoch != last_published_meas_epoch:
+                return True, "new_meas_epoch", sig
+            if args.mqtt_force_publish_seconds > 0 and (now_e - last_publish_epoch) >= args.mqtt_force_publish_seconds:
+                return True, "forced_interval", sig
+            return False, "same_meas_epoch", sig
+
+        if sig != payload_sig_last:
+            return True, "payload_changed_no_meas_epoch", sig
+        if args.mqtt_force_publish_seconds > 0 and (now_e - last_publish_epoch) >= args.mqtt_force_publish_seconds:
+            return True, "forced_interval_no_meas_epoch", sig
+        return False, "same_payload_no_meas_epoch", sig
 
     def one_cycle() -> Tuple[Optional[float], Optional[datetime]]:
         """
@@ -805,11 +837,13 @@ def main():
           meas_epoch (UTC epoch via FactoryTimestamp if possible)
           meas_local_dt (for logs/health display)
         """
+        nonlocal last_published_meas_epoch, last_filtered_payload_sig, last_raw_payload_sig, last_publish_epoch
         health.last_fetch_start = now_ts(tz)
         t0 = time.time()
 
         meas_epoch: Optional[float] = None
         meas_local_dt: Optional[datetime] = None
+        publish_reason = "not_published"
 
         try:
             login = ensure_login()
@@ -867,16 +901,39 @@ def main():
             if args.mqtt_publish and mqtt_pub is not None:
                 pub_raw, pub_filtered = resolve_publish_modes()
                 topic_raw, topic_filtered = mqtt_topics()
+                published_any = False
 
                 if pub_raw:
-                    mqtt_pub.publish(topic_raw, json_dumps_compact(raw), retain=args.mqtt_retain, qos=args.mqtt_qos)
+                    raw_payload = json_dumps_compact(raw)
+                    do_pub, reason, sig = should_publish(raw_payload, meas_epoch, last_raw_payload_sig)
+                    if do_pub:
+                        mqtt_pub.publish(topic_raw, raw_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
+                        published_any = True
+                        publish_reason = f"raw:{reason}"
+                    else:
+                        logger.debug("[mqtt] skip raw publish: %s", reason)
+                    last_raw_payload_sig = sig
                 if pub_filtered:
-                    mqtt_pub.publish(topic_filtered, json_dumps_compact(filtered), retain=args.mqtt_retain, qos=args.mqtt_qos)
+                    filtered_payload = json_dumps_compact(filtered)
+                    do_pub, reason, sig = should_publish(filtered_payload, meas_epoch, last_filtered_payload_sig)
+                    if do_pub:
+                        mqtt_pub.publish(topic_filtered, filtered_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
+                        published_any = True
+                        publish_reason = f"filtered:{reason}"
+                    else:
+                        logger.debug("[mqtt] skip filtered publish: %s", reason)
+                    last_filtered_payload_sig = sig
+
+                if published_any:
+                    last_publish_epoch = time.time()
+                    if meas_epoch is not None:
+                        last_published_meas_epoch = meas_epoch
 
             # ok counters
             health.last_fetch_ok = now_ts(tz)
             health.fetch_ok_count += 1
             health.last_error = ""
+            health.last_publish_reason = publish_reason
 
             # sync log (epoch-based)
             if meas_epoch is not None:
