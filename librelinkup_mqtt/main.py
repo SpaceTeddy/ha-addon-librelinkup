@@ -820,6 +820,10 @@ def main():
         if meas_epoch is not None:
             if last_published_meas_epoch is None or meas_epoch != last_published_meas_epoch:
                 return True, "new_meas_epoch", sig
+            # LibreLinkUp can change data fields without advancing FactoryTimestamp.
+            # In that case, keep /data in sync instead of suppressing the publish.
+            if sig != payload_sig_last:
+                return True, "payload_changed_same_meas_epoch", sig
             if args.mqtt_force_publish_seconds > 0 and (now_e - last_publish_epoch) >= args.mqtt_force_publish_seconds:
                 return True, "forced_interval", sig
             return False, "same_meas_epoch", sig
