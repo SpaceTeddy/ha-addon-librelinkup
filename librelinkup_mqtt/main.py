@@ -360,6 +360,7 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
                 "patientDevice": {
                     "ll": pd.get("ll"),
                     "hl": pd.get("hl"),
+                    "dtid": pd.get("dtid"),
                     "fixedLowAlarmValues": {
                         "mgdl": (pd.get("fixedLowAlarmValues") or {}).get("mgdl")
                     },
@@ -373,7 +374,11 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
     if isinstance(active, list):
         for item in active:
             s = (item or {}).get("sensor") or {}
+            d = (item or {}).get("device") or {}
             out["data"]["activeSensors"].append({
+                "device": {
+                    "dtid": d.get("dtid"),
+                },
                 "sensor": {
                     "deviceId": s.get("deviceId"),
                     "sn": s.get("sn"),
@@ -581,10 +586,28 @@ class HealthState:
 
 
 # -----------------------------
-# Main
+# Runtime state
 # -----------------------------
 
-def main():
+@dataclass
+class PublishState:
+    last_published_meas_epoch: Optional[float] = None
+    last_filtered_payload_sig: str = ""
+    last_raw_payload_sig: str = ""
+    last_publish_epoch: float = 0.0
+
+
+@dataclass
+class SchedulerState:
+    last_meas_epoch: Optional[float] = None
+    last_meas_changed_epoch: float = 0.0
+
+
+# -----------------------------
+# Main workflow helpers
+# -----------------------------
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="LibreLinkUp CLI: token reuse + MQTT publish + filtered JSON + TZ-robust scheduling via FactoryTimestamp."
     )
@@ -657,24 +680,21 @@ def main():
     # Health publishing
     p.add_argument("--mqtt-publish-health", action="store_true", help="Publish health JSON to .../health")
     p.add_argument("--mqtt-health-retain", action="store_true", help="Retain health topic")
+    return p
 
-    args = p.parse_args()
 
-    # timezone for display
+def resolve_timezone(tz_name: str):
     tz = None
     if ZoneInfo is not None:
         try:
-            tz = ZoneInfo(args.tz)
+            tz = ZoneInfo(tz_name)
         except Exception:
             tz = None
+    return tz
 
-    # debug flag compatibility
-    if args.debug and (args.log_level or "").upper() == "INFO":
-        args.log_level = "DEBUG"
 
-    logger = setup_logger(args.log_level, tz)
-
-    client = LibreLinkUpClient(
+def create_client(args: argparse.Namespace, logger: logging.Logger) -> LibreLinkUpClient:
+    return LibreLinkUpClient(
         api_base=args.api_base,
         auth_path=args.auth_path,
         tou_path=args.tou_path,
@@ -685,295 +705,353 @@ def main():
         logger=logger,
     )
 
-    mqtt_pub: Optional[MqttPublisher] = None
-    if args.mqtt_publish:
-        mqtt_pub = MqttPublisher(
-            host=args.mqtt_host,
-            port=args.mqtt_port,
-            user=args.mqtt_user,
-            password=args.mqtt_password,
-            keepalive=args.mqtt_keepalive,
-            base_topic=args.mqtt_base_topic,
-            master_id=args.master_id,
-            tz=tz,
-            logger=logger,
-        )
-        mqtt_pub.connect()
 
-    auth = AuthCache()
-    health = HealthState(start_epoch=time.time())
+def create_mqtt_publisher(args: argparse.Namespace, tz, logger: logging.Logger) -> Optional[MqttPublisher]:
+    if not args.mqtt_publish:
+        return None
 
-    # Scheduler state (epoch-based)
-    last_meas_epoch: Optional[float] = None
-    last_meas_changed_epoch: float = time.time()
-    last_published_meas_epoch: Optional[float] = None
-    last_filtered_payload_sig: str = ""
-    last_raw_payload_sig: str = ""
-    last_publish_epoch: float = 0.0
+    mqtt_pub = MqttPublisher(
+        host=args.mqtt_host,
+        port=args.mqtt_port,
+        user=args.mqtt_user,
+        password=args.mqtt_password,
+        keepalive=args.mqtt_keepalive,
+        base_topic=args.mqtt_base_topic,
+        master_id=args.master_id,
+        tz=tz,
+        logger=logger,
+    )
+    mqtt_pub.connect()
+    return mqtt_pub
 
-    def ensure_login() -> LoginResult:
-        if token_is_valid(auth.login, args.token_min_valid):
-            return auth.login  # type: ignore
 
-        logger.info("=== LOGIN (new/refresh) ===")
-        login = client.auth_user(args.email, args.password)
-        auth.login = login
-        auth.last_login_epoch = time.time()
+def ensure_login(
+    args: argparse.Namespace,
+    client: LibreLinkUpClient,
+    auth: AuthCache,
+    health: HealthState,
+    logger: logging.Logger,
+) -> LoginResult:
+    if token_is_valid(auth.login, args.token_min_valid):
+        return auth.login  # type: ignore
 
-        logger.debug("user_id        : %s", login.user_id)
-        logger.debug("country        : %s", login.country)
-        logger.debug("status         : %s", login.status)
-        logger.debug("token (short)  : %s…", (login.token[:18] if login.token else ""))
-        logger.debug("expires (unix) : %s", login.expires)
-        logger.debug("account_id     : %s", login.account_id)
+    logger.info("=== LOGIN (new/refresh) ===")
+    login = client.auth_user(args.email, args.password)
+    auth.login = login
+    auth.last_login_epoch = time.time()
 
-        if login.status == 4:
-            logger.info("[info] ToU/consent required -> trying tou_user()")
-            try:
-                client.tou_user(login.token)
-            except Exception as ex:
-                logger.warning("[warn] tou_user failed: %s", ex)
+    logger.debug("user_id        : %s", login.user_id)
+    logger.debug("country        : %s", login.country)
+    logger.debug("status         : %s", login.status)
+    logger.debug("token (short)  : %s…", (login.token[:18] if login.token else ""))
+    logger.debug("expires (unix) : %s", login.expires)
+    logger.debug("account_id     : %s", login.account_id)
 
-        return login
-
-    def mqtt_topics() -> Tuple[str, str]:
-        base = args.mqtt_base_topic.strip("/")
-        mid = args.master_id.strip("/")
-        topic_raw = f"{base}/{mid}/{args.mqtt_topic_raw_suffix}"
-        topic_filtered = f"{base}/{mid}/{args.mqtt_topic_filtered_suffix}"
-        return topic_raw, topic_filtered
-
-    def resolve_publish_modes() -> Tuple[bool, bool]:
-        any_flag = bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
-        if any_flag:
-            return bool(args.mqtt_publish_raw), bool(args.mqtt_publish_filtered)
-        return False, True  # default: filtered only
-
-    def token_valid_for_s() -> Optional[int]:
-        if not auth.login:
-            return None
-        return max(0, int(auth.login.expires - time.time()))
-
-    def publish_health():
-        if not (args.mqtt_publish and mqtt_pub):
-            return
-        if not args.mqtt_publish_health:
-            return
-
-        payload = {
-            "ts_local": iso_now(tz),
-            "uptime_s": int(time.time() - health.start_epoch),
-
-            "fetch": {
-                "ok": (health.last_error == ""),
-                "last_start": iso_dt(health.last_fetch_start),
-                "last_ok": iso_dt(health.last_fetch_ok),
-                "last_fail": iso_dt(health.last_fetch_fail),
-                "duration_ms": health.last_fetch_duration_ms,
-                "ok_count": health.fetch_ok_count,
-                "err_count": health.fetch_err_count,
-                "last_error": health.last_error,
-            },
-
-            "cloud": {
-                "ts": health.last_cloud_ts,
-                "factory_ts": health.last_cloud_factory_ts,
-                "lag_s": health.last_cloud_lag_s,
-                "target_lag_s": float(args.fetch_offset_target_lag),
-
-                # display
-                "meas_local_dt": iso_dt(health.last_meas_local_dt),
-                "meas_epoch": health.last_meas_epoch,
-
-                # debug offset info
-                "local_ts": health.last_local_ts,
-                "factory_ts_dbg": health.last_factory_ts,
-                "tz_offset_s": health.last_tz_offset_s,
-                "tz_offset_h": health.last_tz_offset_h,
-                "tz_offset_residual_s": health.last_tz_offset_residual_s,
-                "tz_offset_quality": health.last_tz_offset_quality,
-            },
-
-            "auth": {
-                "token_valid_for_s": token_valid_for_s(),
-                "relogin_count": health.relogin_count,
-            },
-
-            "mqtt": {
-                "connected": bool(mqtt_pub._connected),
-                "reconnects": int(mqtt_pub.reconnects),
-                "last_publish_reason": health.last_publish_reason,
-            }
-        }
-
-        mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
-
-    def should_publish(payload: str, meas_epoch: Optional[float], payload_sig_last: str) -> Tuple[bool, str, str]:
-        sig = sha256_hex(payload)
-        if not args.mqtt_publish_on_change:
-            return True, "always", sig
-
-        now_e = time.time()
-        if last_publish_epoch <= 0:
-            return True, "first", sig
-
-        if meas_epoch is not None:
-            if last_published_meas_epoch is None or meas_epoch != last_published_meas_epoch:
-                return True, "new_meas_epoch", sig
-            # LibreLinkUp can change data fields without advancing FactoryTimestamp.
-            # In that case, keep /data in sync instead of suppressing the publish.
-            if sig != payload_sig_last:
-                return True, "payload_changed_same_meas_epoch", sig
-            if args.mqtt_force_publish_seconds > 0 and (now_e - last_publish_epoch) >= args.mqtt_force_publish_seconds:
-                return True, "forced_interval", sig
-            return False, "same_meas_epoch", sig
-
-        if sig != payload_sig_last:
-            return True, "payload_changed_no_meas_epoch", sig
-        if args.mqtt_force_publish_seconds > 0 and (now_e - last_publish_epoch) >= args.mqtt_force_publish_seconds:
-            return True, "forced_interval_no_meas_epoch", sig
-        return False, "same_payload_no_meas_epoch", sig
-
-    def one_cycle() -> Tuple[Optional[float], Optional[datetime]]:
-        """
-        One fetch/publish cycle.
-        Returns:
-          meas_epoch (UTC epoch via FactoryTimestamp if possible)
-          meas_local_dt (for logs/health display)
-        """
-        nonlocal last_published_meas_epoch, last_filtered_payload_sig, last_raw_payload_sig, last_publish_epoch
-        health.last_fetch_start = now_ts(tz)
-        t0 = time.time()
-
-        meas_epoch: Optional[float] = None
-        meas_local_dt: Optional[datetime] = None
-        publish_reason = "not_published"
-
+    if login.status == 4:
+        logger.info("[info] ToU/consent required -> trying tou_user()")
         try:
-            login = ensure_login()
-
-            logger.debug("=== FETCH GRAPH ===")
-            try:
-                raw = client.get_graph(login.user_id, login.token, login.account_id)
-            except PermissionError:
-                logger.warning("[auth] 401 -> relogin and retry once")
-                auth.login = None
-                health.relogin_count += 1
-                login = ensure_login()
-                raw = client.get_graph(login.user_id, login.token, login.account_id)
-
-            filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
-
-            gm = (((filtered.get("data") or {}).get("connection") or {}).get("glucoseMeasurement") or {})
-            cloud_ts_str = gm.get("Timestamp") or ""
-            cloud_factory_ts_str = gm.get("FactoryTimestamp") or ""
-
-            health.last_cloud_ts = cloud_ts_str
-            health.last_cloud_factory_ts = cloud_factory_ts_str
-
-            # --- Measurement time (robust): FactoryTimestamp -> epoch
-            meas_epoch = parse_factory_epoch(cloud_factory_ts_str)
-            if meas_epoch is not None:
-                meas_local_dt = factory_epoch_to_local_dt(meas_epoch, tz)
-                health.last_cloud_lag_s = time.time() - meas_epoch
-            else:
-                # fallback: use Timestamp only for display; lag is unknown/unstable
-                meas_local_dt = parse_libreview_ts_local(cloud_ts_str, tz)
-                health.last_cloud_lag_s = None
-
-            health.last_meas_epoch = meas_epoch
-            health.last_meas_local_dt = meas_local_dt
-
-            # Debug offset info (optional)
-            off_s, off_h, resid_s, qual = compute_factory_offset(cloud_ts_str, cloud_factory_ts_str)
-            health.last_local_ts = cloud_ts_str
-            health.last_factory_ts = cloud_factory_ts_str
-            health.last_tz_offset_s = off_s
-            health.last_tz_offset_h = off_h
-            health.last_tz_offset_residual_s = resid_s
-            health.last_tz_offset_quality = qual or ""
-
-            # prints
-            if args.print_raw:
-                print("=== RAW GRAPH JSON ===")
-                print(json.dumps(raw, indent=2, ensure_ascii=False))
-            if args.print_filtered:
-                print("=== FILTERED GRAPH JSON ===")
-                print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-            # mqtt publish
-            if args.mqtt_publish and mqtt_pub is not None:
-                pub_raw, pub_filtered = resolve_publish_modes()
-                topic_raw, topic_filtered = mqtt_topics()
-                published_any = False
-
-                if pub_raw:
-                    raw_payload = json_dumps_compact(raw)
-                    do_pub, reason, sig = should_publish(raw_payload, meas_epoch, last_raw_payload_sig)
-                    if do_pub:
-                        mqtt_pub.publish(topic_raw, raw_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
-                        published_any = True
-                        publish_reason = f"raw:{reason}"
-                    else:
-                        logger.debug("[mqtt] skip raw publish: %s", reason)
-                    last_raw_payload_sig = sig
-                if pub_filtered:
-                    filtered_payload = json_dumps_compact(filtered)
-                    do_pub, reason, sig = should_publish(filtered_payload, meas_epoch, last_filtered_payload_sig)
-                    if do_pub:
-                        mqtt_pub.publish(topic_filtered, filtered_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
-                        published_any = True
-                        publish_reason = f"filtered:{reason}"
-                    else:
-                        logger.debug("[mqtt] skip filtered publish: %s", reason)
-                    last_filtered_payload_sig = sig
-
-                if published_any:
-                    last_publish_epoch = time.time()
-                    if meas_epoch is not None:
-                        last_published_meas_epoch = meas_epoch
-
-            # ok counters
-            health.last_fetch_ok = now_ts(tz)
-            health.fetch_ok_count += 1
-            health.last_error = ""
-            health.last_publish_reason = publish_reason
-
-            # sync log (epoch-based)
-            if meas_epoch is not None:
-                lag = time.time() - meas_epoch
-                logger.debug("[sync] lag=%.2fs desired=%.2fs", lag, float(args.fetch_offset_target_lag))
-
-            return meas_epoch, meas_local_dt
-
+            client.tou_user(login.token)
         except Exception as ex:
-            health.last_fetch_fail = now_ts(tz)
-            health.fetch_err_count += 1
-            health.last_error = str(ex)[:300]
-            raise
+            logger.warning("[warn] tou_user failed: %s", ex)
 
-        finally:
-            health.last_fetch_duration_ms = int((time.time() - t0) * 1000)
-            try:
-                publish_health()
-            except Exception as ex:
-                logger.warning("[health] publish failed: %s", ex)
+    return login
 
-    # -----------------------------
-    # single-shot
-    # -----------------------------
-    if not args.loop:
-        try:
-            _ = one_cycle()
-            logger.info("✔ Done")
-        finally:
-            if mqtt_pub:
-                mqtt_pub.close()
+
+def mqtt_topics(args: argparse.Namespace) -> Tuple[str, str]:
+    base = args.mqtt_base_topic.strip("/")
+    mid = args.master_id.strip("/")
+    topic_raw = f"{base}/{mid}/{args.mqtt_topic_raw_suffix}"
+    topic_filtered = f"{base}/{mid}/{args.mqtt_topic_filtered_suffix}"
+    return topic_raw, topic_filtered
+
+
+def resolve_publish_modes(args: argparse.Namespace) -> Tuple[bool, bool]:
+    any_flag = bool(args.mqtt_publish_raw or args.mqtt_publish_filtered)
+    if any_flag:
+        return bool(args.mqtt_publish_raw), bool(args.mqtt_publish_filtered)
+    return False, True  # default: filtered only
+
+
+def token_valid_for_s(auth: AuthCache) -> Optional[int]:
+    if not auth.login:
+        return None
+    return max(0, int(auth.login.expires - time.time()))
+
+
+def publish_health(
+    args: argparse.Namespace,
+    tz,
+    health: HealthState,
+    auth: AuthCache,
+    mqtt_pub: Optional[MqttPublisher],
+):
+    if not (args.mqtt_publish and mqtt_pub):
+        return
+    if not args.mqtt_publish_health:
         return
 
-    # -----------------------------
-    # LOOP: scheduler (epoch + poll-window)
-    # -----------------------------
+    payload = {
+        "ts_local": iso_now(tz),
+        "uptime_s": int(time.time() - health.start_epoch),
+
+        "fetch": {
+            "ok": (health.last_error == ""),
+            "last_start": iso_dt(health.last_fetch_start),
+            "last_ok": iso_dt(health.last_fetch_ok),
+            "last_fail": iso_dt(health.last_fetch_fail),
+            "duration_ms": health.last_fetch_duration_ms,
+            "ok_count": health.fetch_ok_count,
+            "err_count": health.fetch_err_count,
+            "last_error": health.last_error,
+        },
+
+        "cloud": {
+            "ts": health.last_cloud_ts,
+            "factory_ts": health.last_cloud_factory_ts,
+            "lag_s": health.last_cloud_lag_s,
+            "target_lag_s": float(args.fetch_offset_target_lag),
+
+            # display
+            "meas_local_dt": iso_dt(health.last_meas_local_dt),
+            "meas_epoch": health.last_meas_epoch,
+
+            # debug offset info
+            "local_ts": health.last_local_ts,
+            "factory_ts_dbg": health.last_factory_ts,
+            "tz_offset_s": health.last_tz_offset_s,
+            "tz_offset_h": health.last_tz_offset_h,
+            "tz_offset_residual_s": health.last_tz_offset_residual_s,
+            "tz_offset_quality": health.last_tz_offset_quality,
+        },
+
+        "auth": {
+            "token_valid_for_s": token_valid_for_s(auth),
+            "relogin_count": health.relogin_count,
+        },
+
+        "mqtt": {
+            "connected": bool(mqtt_pub._connected),
+            "reconnects": int(mqtt_pub.reconnects),
+            "last_publish_reason": health.last_publish_reason,
+        }
+    }
+
+    mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
+
+
+def should_publish(
+    args: argparse.Namespace,
+    publish_state: PublishState,
+    payload: str,
+    meas_epoch: Optional[float],
+    payload_sig_last: str,
+) -> Tuple[bool, str, str]:
+    sig = sha256_hex(payload)
+    if not args.mqtt_publish_on_change:
+        return True, "always", sig
+
+    now_e = time.time()
+    if publish_state.last_publish_epoch <= 0:
+        return True, "first", sig
+
+    if meas_epoch is not None:
+        if publish_state.last_published_meas_epoch is None or meas_epoch != publish_state.last_published_meas_epoch:
+            return True, "new_meas_epoch", sig
+        # LibreLinkUp can change data fields without advancing FactoryTimestamp.
+        # In that case, keep /data in sync instead of suppressing the publish.
+        if sig != payload_sig_last:
+            return True, "payload_changed_same_meas_epoch", sig
+        if args.mqtt_force_publish_seconds > 0 and (now_e - publish_state.last_publish_epoch) >= args.mqtt_force_publish_seconds:
+            return True, "forced_interval", sig
+        return False, "same_meas_epoch", sig
+
+    if sig != payload_sig_last:
+        return True, "payload_changed_no_meas_epoch", sig
+    if args.mqtt_force_publish_seconds > 0 and (now_e - publish_state.last_publish_epoch) >= args.mqtt_force_publish_seconds:
+        return True, "forced_interval_no_meas_epoch", sig
+    return False, "same_payload_no_meas_epoch", sig
+
+
+def publish_mqtt_payloads(
+    args: argparse.Namespace,
+    mqtt_pub: Optional[MqttPublisher],
+    publish_state: PublishState,
+    raw: Dict[str, Any],
+    filtered: Dict[str, Any],
+    meas_epoch: Optional[float],
+    logger: logging.Logger,
+) -> str:
+    if not (args.mqtt_publish and mqtt_pub is not None):
+        return "not_published"
+
+    pub_raw, pub_filtered = resolve_publish_modes(args)
+    topic_raw, topic_filtered = mqtt_topics(args)
+    published_any = False
+    publish_reason = "not_published"
+
+    if pub_raw:
+        raw_payload = json_dumps_compact(raw)
+        do_pub, reason, sig = should_publish(args, publish_state, raw_payload, meas_epoch, publish_state.last_raw_payload_sig)
+        if do_pub:
+            mqtt_pub.publish(topic_raw, raw_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
+            published_any = True
+            publish_reason = f"raw:{reason}"
+        else:
+            logger.debug("[mqtt] skip raw publish: %s", reason)
+        publish_state.last_raw_payload_sig = sig
+
+    if pub_filtered:
+        filtered_payload = json_dumps_compact(filtered)
+        do_pub, reason, sig = should_publish(args, publish_state, filtered_payload, meas_epoch, publish_state.last_filtered_payload_sig)
+        if do_pub:
+            mqtt_pub.publish(topic_filtered, filtered_payload, retain=args.mqtt_retain, qos=args.mqtt_qos)
+            published_any = True
+            publish_reason = f"filtered:{reason}"
+        else:
+            logger.debug("[mqtt] skip filtered publish: %s", reason)
+        publish_state.last_filtered_payload_sig = sig
+
+    if published_any:
+        publish_state.last_publish_epoch = time.time()
+        if meas_epoch is not None:
+            publish_state.last_published_meas_epoch = meas_epoch
+
+    return publish_reason
+
+
+def one_cycle(
+    args: argparse.Namespace,
+    tz,
+    client: LibreLinkUpClient,
+    mqtt_pub: Optional[MqttPublisher],
+    auth: AuthCache,
+    health: HealthState,
+    publish_state: PublishState,
+    logger: logging.Logger,
+) -> Tuple[Optional[float], Optional[datetime]]:
+    """
+    One fetch/publish cycle.
+    Returns:
+      meas_epoch (UTC epoch via FactoryTimestamp if possible)
+      meas_local_dt (for logs/health display)
+    """
+    health.last_fetch_start = now_ts(tz)
+    t0 = time.time()
+
+    meas_epoch: Optional[float] = None
+    meas_local_dt: Optional[datetime] = None
+    publish_reason = "not_published"
+
+    try:
+        login = ensure_login(args, client, auth, health, logger)
+
+        logger.debug("=== FETCH GRAPH ===")
+        try:
+            raw = client.get_graph(login.user_id, login.token, login.account_id)
+        except PermissionError:
+            logger.warning("[auth] 401 -> relogin and retry once")
+            auth.login = None
+            health.relogin_count += 1
+            login = ensure_login(args, client, auth, health, logger)
+            raw = client.get_graph(login.user_id, login.token, login.account_id)
+
+        filtered = filter_graph_json(raw, graph_limit=args.graph_limit)
+
+        gm = (((filtered.get("data") or {}).get("connection") or {}).get("glucoseMeasurement") or {})
+        cloud_ts_str = gm.get("Timestamp") or ""
+        cloud_factory_ts_str = gm.get("FactoryTimestamp") or ""
+
+        health.last_cloud_ts = cloud_ts_str
+        health.last_cloud_factory_ts = cloud_factory_ts_str
+
+        # --- Measurement time (robust): FactoryTimestamp -> epoch
+        meas_epoch = parse_factory_epoch(cloud_factory_ts_str)
+        if meas_epoch is not None:
+            meas_local_dt = factory_epoch_to_local_dt(meas_epoch, tz)
+            health.last_cloud_lag_s = time.time() - meas_epoch
+        else:
+            # fallback: use Timestamp only for display; lag is unknown/unstable
+            meas_local_dt = parse_libreview_ts_local(cloud_ts_str, tz)
+            health.last_cloud_lag_s = None
+
+        health.last_meas_epoch = meas_epoch
+        health.last_meas_local_dt = meas_local_dt
+
+        # Debug offset info (optional)
+        off_s, off_h, resid_s, qual = compute_factory_offset(cloud_ts_str, cloud_factory_ts_str)
+        health.last_local_ts = cloud_ts_str
+        health.last_factory_ts = cloud_factory_ts_str
+        health.last_tz_offset_s = off_s
+        health.last_tz_offset_h = off_h
+        health.last_tz_offset_residual_s = resid_s
+        health.last_tz_offset_quality = qual or ""
+
+        # prints
+        if args.print_raw:
+            print("=== RAW GRAPH JSON ===")
+            print(json.dumps(raw, indent=2, ensure_ascii=False))
+        if args.print_filtered:
+            print("=== FILTERED GRAPH JSON ===")
+            print(json.dumps(filtered, indent=2, ensure_ascii=False))
+
+        publish_reason = publish_mqtt_payloads(args, mqtt_pub, publish_state, raw, filtered, meas_epoch, logger)
+
+        # ok counters
+        health.last_fetch_ok = now_ts(tz)
+        health.fetch_ok_count += 1
+        health.last_error = ""
+        health.last_publish_reason = publish_reason
+
+        # sync log (epoch-based)
+        if meas_epoch is not None:
+            lag = time.time() - meas_epoch
+            logger.debug("[sync] lag=%.2fs desired=%.2fs", lag, float(args.fetch_offset_target_lag))
+
+        return meas_epoch, meas_local_dt
+
+    except Exception as ex:
+        health.last_fetch_fail = now_ts(tz)
+        health.fetch_err_count += 1
+        health.last_error = str(ex)[:300]
+        raise
+
+    finally:
+        health.last_fetch_duration_ms = int((time.time() - t0) * 1000)
+        try:
+            publish_health(args, tz, health, auth, mqtt_pub)
+        except Exception as ex:
+            logger.warning("[health] publish failed: %s", ex)
+
+
+def run_single_cycle(
+    args: argparse.Namespace,
+    tz,
+    client: LibreLinkUpClient,
+    mqtt_pub: Optional[MqttPublisher],
+    auth: AuthCache,
+    health: HealthState,
+    publish_state: PublishState,
+    logger: logging.Logger,
+):
+    try:
+        _ = one_cycle(args, tz, client, mqtt_pub, auth, health, publish_state, logger)
+        logger.info("✔ Done")
+    finally:
+        if mqtt_pub:
+            mqtt_pub.close()
+
+
+def run_loop(
+    args: argparse.Namespace,
+    tz,
+    client: LibreLinkUpClient,
+    mqtt_pub: Optional[MqttPublisher],
+    auth: AuthCache,
+    health: HealthState,
+    publish_state: PublishState,
+    scheduler_state: SchedulerState,
+    logger: logging.Logger,
+):
     interval_s = float(args.interval)
     target_lag = float(args.fetch_offset_target_lag)
     poll_s = float(args.poll_seconds)
@@ -991,10 +1069,8 @@ def main():
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
-            now_e = time.time()
-
             try:
-                meas_epoch, meas_local_dt = one_cycle()
+                meas_epoch, meas_local_dt = one_cycle(args, tz, client, mqtt_pub, auth, health, publish_state, logger)
             except KeyboardInterrupt:
                 raise
             except Exception as ex:
@@ -1004,25 +1080,24 @@ def main():
             # update scheduler state: detect new measurement
             now_e = time.time()
             if meas_epoch is not None:
-                if last_meas_epoch is None or meas_epoch != last_meas_epoch:
-                    last_meas_epoch = meas_epoch
-                    last_meas_changed_epoch = now_e
+                if scheduler_state.last_meas_epoch is None or meas_epoch != scheduler_state.last_meas_epoch:
+                    scheduler_state.last_meas_epoch = meas_epoch
+                    scheduler_state.last_meas_changed_epoch = now_e
 
             # schedule next run
-            if last_meas_epoch is None:
+            if scheduler_state.last_meas_epoch is None:
                 # no valid meas yet -> simple interval
                 next_run = now_e + interval_s
                 logger.debug("[schedule] no last_meas -> next_run=%s",
                              factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run))
                 continue
 
-            expected_next = last_meas_epoch + interval_s + target_lag
+            expected_next = scheduler_state.last_meas_epoch + interval_s + target_lag
 
             if now_e < expected_next:
                 next_run = expected_next
-                # display
                 exp_local = factory_epoch_to_local_dt(expected_next, tz) if tz else datetime.fromtimestamp(expected_next)
-                lm_local = factory_epoch_to_local_dt(last_meas_epoch, tz) if tz else datetime.fromtimestamp(last_meas_epoch)
+                lm_local = factory_epoch_to_local_dt(scheduler_state.last_meas_epoch, tz) if tz else datetime.fromtimestamp(scheduler_state.last_meas_epoch)
                 logger.debug("[schedule] last_meas=%s expected_next=%s sleep=%.3fs",
                              lm_local.strftime("%Y-%m-%d %H:%M:%S"),
                              exp_local.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1030,12 +1105,12 @@ def main():
                 continue
 
             # past expected_next: cloud may still show old measurement -> poll window
-            poll_age = now_e - last_meas_changed_epoch
+            poll_age = now_e - scheduler_state.last_meas_changed_epoch
             if poll_age <= poll_max_s:
                 next_run = now_e + poll_s
                 nr_local = factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run)
                 logger.debug("[schedule] expected_next passed; meas_still=%s; POLL next_run=%s (poll_age=%.1fs)",
-                             factory_epoch_to_local_dt(last_meas_epoch, tz).strftime("%Y-%m-%d %H:%M:%S") if tz else datetime.fromtimestamp(last_meas_epoch),
+                             factory_epoch_to_local_dt(scheduler_state.last_meas_epoch, tz).strftime("%Y-%m-%d %H:%M:%S") if tz else datetime.fromtimestamp(scheduler_state.last_meas_epoch),
                              nr_local.strftime("%Y-%m-%d %H:%M:%S"),
                              poll_age)
             else:
@@ -1043,10 +1118,35 @@ def main():
                 nr_local = factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run)
                 logger.debug("[schedule] poll_max exceeded (%.1fs) -> fallback next_run=%s",
                              poll_age, nr_local.strftime("%Y-%m-%d %H:%M:%S"))
-
     finally:
         if mqtt_pub:
             mqtt_pub.close()
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    tz = resolve_timezone(args.tz)
+
+    # debug flag compatibility
+    if args.debug and (args.log_level or "").upper() == "INFO":
+        args.log_level = "DEBUG"
+
+    logger = setup_logger(args.log_level, tz)
+    client = create_client(args, logger)
+    mqtt_pub = create_mqtt_publisher(args, tz, logger)
+
+    auth = AuthCache()
+    health = HealthState(start_epoch=time.time())
+    publish_state = PublishState()
+    scheduler_state = SchedulerState(last_meas_changed_epoch=time.time())
+
+    if not args.loop:
+        run_single_cycle(args, tz, client, mqtt_pub, auth, health, publish_state, logger)
+        return
+
+    run_loop(args, tz, client, mqtt_pub, auth, health, publish_state, scheduler_state, logger)
 
 
 if __name__ == "__main__":
