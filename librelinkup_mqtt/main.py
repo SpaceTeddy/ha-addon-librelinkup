@@ -360,6 +360,7 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
                 "patientDevice": {
                     "ll": pd.get("ll"),
                     "hl": pd.get("hl"),
+                    "dtid": pd.get("dtid"),
                     "fixedLowAlarmValues": {
                         "mgdl": (pd.get("fixedLowAlarmValues") or {}).get("mgdl")
                     },
@@ -373,7 +374,11 @@ def filter_graph_json(raw: Dict[str, Any], graph_limit: int = 0) -> Dict[str, An
     if isinstance(active, list):
         for item in active:
             s = (item or {}).get("sensor") or {}
+            d = (item or {}).get("device") or {}
             out["data"]["activeSensors"].append({
+                "device": {
+                    "dtid": d.get("dtid"),
+                },
                 "sensor": {
                     "deviceId": s.get("deviceId"),
                     "sn": s.get("sn"),
