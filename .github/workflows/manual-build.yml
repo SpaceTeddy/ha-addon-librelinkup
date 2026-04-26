@@ -2,6 +2,16 @@ name: Manueller Build & Publish (Branch-Auswahl)
 
 on:
   workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 env:
   REGISTRY: ghcr.io
@@ -11,12 +21,43 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
       - name: Checkout (gewählter Branch)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Version hochzählen und config.yaml aktualisieren
+        id: ver
+        shell: bash
+        run: |
+          CURRENT=$(grep -E '^version:' librelinkup_mqtt/config.yaml | head -n1 | sed -E 's/^[^"]*"([^"]+)".*/\1/')
+          echo "Aktuelle Version: $CURRENT"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Neue Version: $NEW"
+
+          sed -i "s/^version: \".*\"/version: \"${NEW}\"/" librelinkup_mqtt/config.yaml
+
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Versionsänderung committen und pushen
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add librelinkup_mqtt/config.yaml
+          git commit -m "Bump version to ${{ steps.ver.outputs.version }}"
+          git push
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -30,18 +71,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Version aus librelinkup_mqtt/config.yaml lesen
-        id: ver
-        shell: bash
-        run: |
-          RAW=$(grep -E '^version:' librelinkup_mqtt/config.yaml | head -n1 || true)
-          VER=$(echo "$RAW" | sed -E 's/^[^"]+"([^"]+)".*$/\1/')
-          if [[ -z "$VER" ]]; then
-            VER="latest"
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "Branch: ${{ github.ref_name }}  Version: $VER"
 
       - name: Tags vorbereiten
         id: prep
