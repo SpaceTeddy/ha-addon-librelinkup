@@ -968,7 +968,14 @@ def one_cycle(
         meas_epoch = parse_factory_epoch(cloud_factory_ts_str)
         if meas_epoch is not None:
             meas_local_dt = factory_epoch_to_local_dt(meas_epoch, tz)
-            health.last_cloud_lag_s = time.time() - meas_epoch
+            lag = time.time() - meas_epoch
+            if lag < -10:
+                logger.warning(
+                    "[sync] meas_epoch liegt %.1fs in der Zukunft — "
+                    "FactoryTimestamp UTC-Annahme prüfen! (factory_ts=%r)",
+                    -lag, cloud_factory_ts_str,
+                )
+            health.last_cloud_lag_s = lag
         else:
             # fallback: use Timestamp only for display; lag is unknown/unstable
             meas_local_dt = parse_libreview_ts_local(cloud_ts_str, tz)
@@ -1093,6 +1100,17 @@ def run_loop(
                 continue
 
             expected_next = scheduler_state.last_meas_epoch + interval_s + target_lag
+
+            # Cap: falls expected_next unrealistisch weit in der Zukunft liegt
+            # (z.B. FactoryTimestamp-UTC-Annahme falsch), nicht ewig schlafen.
+            max_next = now_e + interval_s + poll_max_s
+            if expected_next > max_next:
+                logger.warning(
+                    "[schedule] expected_next liegt %.1fs in der Zukunft — cap auf %.0fs. "
+                    "FactoryTimestamp UTC-Annahme prüfen!",
+                    expected_next - now_e, interval_s + poll_max_s,
+                )
+                expected_next = max_next
 
             if now_e < expected_next:
                 next_run = expected_next
