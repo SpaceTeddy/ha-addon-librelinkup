@@ -1,0 +1,64 @@
+name: Manueller Build & Publish (Branch-Auswahl)
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: spaceteddy/librelinkup_mqtt
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout (gewählter Branch)
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version aus librelinkup_mqtt/config.yaml lesen
+        id: ver
+        shell: bash
+        run: |
+          RAW=$(grep -E '^version:' librelinkup_mqtt/config.yaml | head -n1 || true)
+          VER=$(echo "$RAW" | sed -E 's/^[^"]+"([^"]+)".*$/\1/')
+          if [[ -z "$VER" ]]; then
+            VER="latest"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Branch: ${{ github.ref_name }}  Version: $VER"
+
+      - name: Tags vorbereiten
+        id: prep
+        shell: bash
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}"
+          TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Baue Tags: $TAGS"
+
+      - name: Build & Push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./librelinkup_mqtt
+          file: ./librelinkup_mqtt/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: ${{ steps.prep.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
