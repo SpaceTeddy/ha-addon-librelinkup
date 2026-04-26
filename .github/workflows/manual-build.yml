@@ -50,14 +50,25 @@ jobs:
 
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
 
-      - name: Versionsänderung committen und pushen
+      - name: Versionsänderung committen und pushen (Branch + main)
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Version auf dem gewählten Branch committen
           git add librelinkup_mqtt/config.yaml
           git commit -m "Bump version to ${{ steps.ver.outputs.version }}"
           git push
+
+          # Version auch auf main eintragen, damit HA das Update erkennt
+          git fetch origin main
+          git checkout main
+          sed -i "s/^version: \".*\"/version: \"${{ steps.ver.outputs.version }}\"/" librelinkup_mqtt/config.yaml
+          git add librelinkup_mqtt/config.yaml
+          git commit -m "Bump version to ${{ steps.ver.outputs.version }}" || echo "main already up to date"
+          git push origin main
+          git checkout ${{ github.ref_name }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
