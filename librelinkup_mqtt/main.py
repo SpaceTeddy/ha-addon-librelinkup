@@ -601,6 +601,7 @@ class PublishState:
 class SchedulerState:
     last_meas_epoch: Optional[float] = None
     last_meas_changed_epoch: float = 0.0
+    anchor_lost: bool = False
 
 
 # -----------------------------
@@ -1081,13 +1082,19 @@ def run_loop(
             except KeyboardInterrupt:
                 raise
             except Exception as ex:
-                logger.error("cycle failed: %s", ex)
+                logger.error("cycle failed: %s — Anker verloren, Fallback auf interval", ex)
                 meas_epoch, meas_local_dt = None, None
+                scheduler_state.anchor_lost = True
 
             # update scheduler state: detect new measurement
             now_e = time.time()
             if meas_epoch is not None:
                 if scheduler_state.last_meas_epoch is None or meas_epoch != scheduler_state.last_meas_epoch:
+                    if scheduler_state.anchor_lost:
+                        logger.info("[schedule] re-sync auf Sensor-Takt (meas_epoch=%s)",
+                                    factory_epoch_to_local_dt(meas_epoch, tz).strftime("%Y-%m-%d %H:%M:%S")
+                                    if tz else datetime.fromtimestamp(meas_epoch).strftime("%Y-%m-%d %H:%M:%S"))
+                        scheduler_state.anchor_lost = False
                     scheduler_state.last_meas_epoch = meas_epoch
                     scheduler_state.last_meas_changed_epoch = now_e
 
@@ -1132,10 +1139,12 @@ def run_loop(
                              nr_local.strftime("%Y-%m-%d %H:%M:%S"),
                              poll_age)
             else:
+                scheduler_state.anchor_lost = True
                 next_run = now_e + interval_s
                 nr_local = factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run)
-                logger.debug("[schedule] poll_max exceeded (%.1fs) -> fallback next_run=%s",
-                             poll_age, nr_local.strftime("%Y-%m-%d %H:%M:%S"))
+                logger.warning("[schedule] poll_max (%.0fs) überschritten (poll_age=%.1fs) — "
+                               "Anker verloren, Fallback auf interval next_run=%s",
+                               poll_max_s, poll_age, nr_local.strftime("%Y-%m-%d %H:%M:%S"))
     finally:
         if mqtt_pub:
             mqtt_pub.close()
