@@ -90,6 +90,17 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _rc_ok(rc: Any) -> bool:
+    """
+    Erfolgspruefung fuer einen MQTT-Returncode.
+    paho 1.x liefert ein int (0 = ok), paho 2.x ein ReasonCode-Objekt.
+    """
+    is_failure = getattr(rc, "is_failure", None)
+    if is_failure is not None:
+        return not is_failure
+    return rc == 0
+
+
 def json_dumps_compact(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
@@ -462,8 +473,14 @@ class MqttPublisher:
         self._connected = False
         self.reconnects = 0
 
-        # Keep v1 for backwards compatibility with your container image
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        # paho-mqtt 2.x: Callback-API v2. Die v1-API loest dort eine
+        # DeprecationWarning aus und faellt in kommenden Versionen weg.
+        # Der Fallback greift nur, wenn jemand die CLI mit paho-mqtt 1.x
+        # betreibt — dort gibt es CallbackAPIVersion noch nicht.
+        try:
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            self.client = mqtt.Client()
 
         if user:
             self.client.username_pw_set(user, password=password)
@@ -481,9 +498,11 @@ class MqttPublisher:
         })
         self.client.will_set(self.topic_status, payload=lwt_payload, qos=0, retain=True)
 
-    def _on_connect(self, client, userdata, flags, rc):
-        self._connected = (rc == 0)
-        self.log.debug("[mqtt] on_connect rc=%s connected=%s", rc, self._connected)
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        # v1 ruft mit 4 Argumenten (rc als int), v2 mit 5 (reason_code als
+        # ReasonCode). properties=None faengt den Unterschied ab.
+        self._connected = _rc_ok(reason_code)
+        self.log.debug("[mqtt] on_connect rc=%s connected=%s", reason_code, self._connected)
 
         if self._connected:
             try:
@@ -494,7 +513,9 @@ class MqttPublisher:
             except Exception as ex:
                 self.log.warning("[mqtt] failed to publish online status: %s", ex)
 
-    def _on_disconnect(self, client, userdata, rc):
+    def _on_disconnect(self, client, userdata, *args):
+        # v1: (rc,)   v2: (disconnect_flags, reason_code, properties)
+        rc = args[1] if len(args) >= 2 else (args[0] if args else None)
         self._connected = False
         self.log.debug("[mqtt] on_disconnect rc=%s", rc)
 
