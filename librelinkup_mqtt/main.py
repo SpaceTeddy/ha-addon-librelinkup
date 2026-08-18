@@ -145,6 +145,11 @@ def factory_epoch_to_local_dt(epoch_s: float, tz) -> datetime:
     return dt_utc.astimezone(tz) if tz else dt_utc.replace(tzinfo=None)
 
 
+# Nach so vielen aufeinanderfolgenden "aelteren" Messungen wird der Rueckwaerts-
+# sprung als dauerhaft angesehen und neu verankert, statt ewig zu blockieren.
+MAX_CONSECUTIVE_OLDER = 10
+
+
 def next_grid_run(
     last_meas_epoch: float,
     interval_s: float,
@@ -645,9 +650,13 @@ class SchedulerState:
     # Fehler-Backoff
     consecutive_errors: int = 0
 
+    # Cloud liefert zeitweise eine ältere Messung aus
+    consecutive_older: int = 0
+
     # Zähler für /health
     missed_count: int = 0
     resync_count: int = 0
+    stale_meas_count: int = 0
 
 
 def update_delay_model(
@@ -940,6 +949,8 @@ def publish_health(
             "missed_total": int(sched.missed_count),
             "resync_count": int(sched.resync_count),
             "consecutive_errors": int(sched.consecutive_errors),
+            "stale_meas_total": int(sched.stale_meas_count),
+            "consecutive_older": int(sched.consecutive_older),
         }
 
     mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
@@ -961,8 +972,15 @@ def should_publish(
         return True, "first", sig
 
     if meas_epoch is not None:
-        if publish_state.last_published_meas_epoch is None or meas_epoch != publish_state.last_published_meas_epoch:
+        last_pub = publish_state.last_published_meas_epoch
+        if last_pub is None or meas_epoch > last_pub:
             return True, "new_meas_epoch", sig
+        # Die LibreLinkUp-Cloud liefert zeitweise eine ÄLTERE Messung aus
+        # (verschiedene Backend-Knoten mit unterschiedlichem Cache-Stand).
+        # Die darf nicht als aktueller Wert veröffentlicht werden, sonst zeigt
+        # Home Assistant einen minutenalten Glukosewert als aktuell an.
+        if meas_epoch < last_pub:
+            return False, "stale_meas_epoch", sig
         # LibreLinkUp can change data fields without advancing FactoryTimestamp.
         # In that case, keep /data in sync instead of suppressing the publish.
         if sig != payload_sig_last:
@@ -1226,9 +1244,35 @@ def run_loop(
                 continue
 
             now_e = time.time()
-            is_new = meas_epoch is not None and (
-                sched.last_meas_epoch is None or meas_epoch != sched.last_meas_epoch
-            )
+
+            # --- Nur echt neuere Messungen duerfen den Anker bewegen ---
+            # Die Cloud liefert zeitweise eine aeltere Messung aus. Wuerde die
+            # als "neu" gelten, ruckelte das Raster rueckwaerts und ein alter
+            # Glukosewert erschiene als aktueller.
+            is_new = False
+            if meas_epoch is not None:
+                last = sched.last_meas_epoch
+                if last is None or meas_epoch > last:
+                    is_new = True
+                    sched.consecutive_older = 0
+                elif meas_epoch < last:
+                    sched.consecutive_older += 1
+                    sched.stale_meas_count += 1
+                    if sched.consecutive_older >= MAX_CONSECUTIVE_OLDER:
+                        # Dauerhafter Rueckwaertssprung (Uhrumstellung, API-Wechsel,
+                        # Sensortausch): nicht ewig blockieren, neu verankern.
+                        logger.warning("[cloud] seit %d Abfragen nur aeltere Messungen — "
+                                       "%s wird neuer Anker",
+                                       sched.consecutive_older, hhmmss(meas_epoch))
+                        is_new = True
+                        sched.consecutive_older = 0
+                        publish_state.last_published_meas_epoch = None
+                    else:
+                        logger.warning("[cloud] aeltere Messung geliefert: %s statt %s "
+                                       "(%.0fs rueckwaerts) — ignoriert, Raster bleibt",
+                                       hhmmss(meas_epoch), hhmmss(last), last - meas_epoch)
+                else:
+                    sched.consecutive_older = 0
 
             # --- Neue Messung: Raster nachführen und Ankunftsmodell lernen ---
             if is_new:
