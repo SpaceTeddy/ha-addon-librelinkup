@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -142,6 +143,35 @@ def parse_factory_epoch(ts_factory: Optional[str]) -> Optional[float]:
 def factory_epoch_to_local_dt(epoch_s: float, tz) -> datetime:
     dt_utc = datetime.fromtimestamp(epoch_s, tz=timezone.utc)
     return dt_utc.astimezone(tz) if tz else dt_utc.replace(tzinfo=None)
+
+
+def next_grid_run(
+    last_meas_epoch: float,
+    interval_s: float,
+    lag_s: float,
+    now_e: float,
+    min_step: float = 1.0,
+) -> float:
+    """
+    Nächster Zeitpunkt auf dem Messraster des Sensors:
+        last_meas_epoch + k * interval_s + lag_s     (k >= 1)
+    Es wird der kleinste solche Zeitpunkt gewählt, der echt in der Zukunft liegt.
+
+    Dadurch bleibt die Phasenlage zum Sensor auch nach Fehlern, Aussetzern oder
+    langen Cloud-Pausen erhalten — im Gegensatz zu "now + interval", das die
+    Phaseninformation verwirft.
+
+    min_step verhindert einen Floating-Point-Grenzfall: liegt das Raster exakt
+    auf now_e, würde ohne diese Korrektur ein Zeitschritt von ~0s entstehen und
+    der Loop die API in einer Endlosschleife abfragen.
+    """
+    k = math.floor((now_e - last_meas_epoch - lag_s) / interval_s) + 1
+    if k < 1:
+        k = 1
+    t = last_meas_epoch + k * interval_s + lag_s
+    if t < now_e + min_step:
+        t = last_meas_epoch + (k + 1) * interval_s + lag_s
+    return t
 
 
 def compute_factory_offset(
@@ -601,7 +631,57 @@ class PublishState:
 class SchedulerState:
     last_meas_epoch: Optional[float] = None
     last_meas_changed_epoch: float = 0.0
-    anchor_lost: bool = False
+
+    # Adaptives Modell der Cloud-Verzögerung (wann taucht eine Messung wirklich auf)
+    delay_ema: Optional[float] = None       # gleitender Mittelwert der Ankunftsverzögerung
+    delay_dev: Optional[float] = None       # gleitende mittlere Abweichung davon
+    effective_lag: float = 0.0              # daraus abgeleiteter Weckversatz
+
+    # Poll-Fenster
+    poll_deadline: Optional[float] = None
+    consecutive_missed: int = 0
+    stale: bool = False
+
+    # Fehler-Backoff
+    consecutive_errors: int = 0
+
+    # Zähler für /health
+    missed_count: int = 0
+    resync_count: int = 0
+
+
+def update_delay_model(
+    sched: SchedulerState,
+    observed_delay_s: float,
+    args: argparse.Namespace,
+    interval_s: float,
+) -> None:
+    """
+    Lernt, wie lange die Cloud typischerweise braucht, bis eine Messung sichtbar ist.
+
+    Statt stur bei meas + target_lag zu wecken (und dann minutenlang zu pollen),
+    weckt der Scheduler kurz vor der erwarteten Ankunft. Der Vorlauf richtet sich
+    nach der beobachteten Streuung, damit wir zuverlässig knapp davor liegen.
+    """
+    if not (0.0 <= observed_delay_s <= interval_s * 3):
+        return  # Ausreißer (z.B. Cloud-Nachlauf nach Aussetzer) nicht einlernen
+
+    alpha = clamp(float(args.lag_ema_alpha), 0.01, 1.0)
+    poll_s = float(args.poll_seconds)
+
+    if sched.delay_ema is None or sched.delay_dev is None:
+        sched.delay_ema = observed_delay_s
+        sched.delay_dev = poll_s
+    else:
+        sched.delay_dev = (1.0 - alpha) * sched.delay_dev + alpha * abs(observed_delay_s - sched.delay_ema)
+        sched.delay_ema = (1.0 - alpha) * sched.delay_ema + alpha * observed_delay_s
+
+    lead = max(poll_s, float(args.lag_lead_factor) * sched.delay_dev)
+    sched.effective_lag = clamp(
+        sched.delay_ema - lead,
+        float(args.fetch_offset_target_lag),
+        interval_s * 2.0,
+    )
 
 
 # -----------------------------
@@ -651,6 +731,18 @@ def build_parser() -> argparse.ArgumentParser:
     # scheduler knobs
     p.add_argument("--poll-seconds", type=float, default=10.0, help="Poll interval when cloud caches (default 10s)")
     p.add_argument("--poll-max-seconds", type=float, default=120.0, help="Max poll window (default 120s)")
+    p.add_argument("--no-adaptive-lag", action="store_true",
+                   help="Disable learning of the cloud arrival delay; always wake at meas + target lag")
+    p.add_argument("--lag-ema-alpha", type=float, default=0.3,
+                   help="Smoothing factor for the arrival-delay model (default 0.3)")
+    p.add_argument("--lag-lead-factor", type=float, default=1.5,
+                   help="Wake this many mean-deviations before the expected arrival (default 1.5)")
+    p.add_argument("--stale-after", type=int, default=2,
+                   help="Enter stale mode after this many consecutive skipped measurements (default 2)")
+    p.add_argument("--stale-poll-seconds", type=float, default=30.0,
+                   help="Check interval while the cloud is stale (default 30s)")
+    p.add_argument("--error-retry-seconds", type=float, default=10.0,
+                   help="Base retry delay after a failed cycle, grows linearly up to interval (default 10s)")
 
     # token reuse
     p.add_argument("--token-min-valid", type=int, default=90,
@@ -785,6 +877,7 @@ def publish_health(
     health: HealthState,
     auth: AuthCache,
     mqtt_pub: Optional[MqttPublisher],
+    sched: Optional["SchedulerState"] = None,
 ):
     if not (args.mqtt_publish and mqtt_pub):
         return
@@ -836,6 +929,18 @@ def publish_health(
             "last_publish_reason": health.last_publish_reason,
         }
     }
+
+    if sched is not None:
+        payload["sched"] = {
+            "effective_lag_s": round(sched.effective_lag, 1),
+            "delay_ema_s": round(sched.delay_ema, 1) if sched.delay_ema is not None else None,
+            "delay_dev_s": round(sched.delay_dev, 1) if sched.delay_dev is not None else None,
+            "stale": bool(sched.stale),
+            "consecutive_missed": int(sched.consecutive_missed),
+            "missed_total": int(sched.missed_count),
+            "resync_count": int(sched.resync_count),
+            "consecutive_errors": int(sched.consecutive_errors),
+        }
 
     mqtt_pub.publish_health(payload, retain=bool(args.mqtt_health_retain), qos=0)
 
@@ -929,6 +1034,7 @@ def one_cycle(
     health: HealthState,
     publish_state: PublishState,
     logger: logging.Logger,
+    sched: Optional[SchedulerState] = None,
 ) -> Tuple[Optional[float], Optional[datetime]]:
     """
     One fetch/publish cycle.
@@ -1026,7 +1132,7 @@ def one_cycle(
     finally:
         health.last_fetch_duration_ms = int((time.time() - t0) * 1000)
         try:
-            publish_health(args, tz, health, auth, mqtt_pub)
+            publish_health(args, tz, health, auth, mqtt_pub, sched)
         except Exception as ex:
             logger.warning("[health] publish failed: %s", ex)
 
@@ -1060,13 +1166,38 @@ def run_loop(
     scheduler_state: SchedulerState,
     logger: logging.Logger,
 ):
+    sched = scheduler_state
+
     interval_s = float(args.interval)
     target_lag = float(args.fetch_offset_target_lag)
     poll_s = float(args.poll_seconds)
     poll_max_s = float(args.poll_max_seconds)
+    stale_poll_s = float(args.stale_poll_seconds)
+    stale_after = max(1, int(args.stale_after))
+    err_retry_s = float(args.error_retry_seconds)
+    adaptive = not args.no_adaptive_lag
 
-    logger.info("[loop] interval=%ss initial_delay=%.2fs tz=%s target_lag=%.2fs poll=%.1fs poll_max=%.0fs",
-                args.interval, float(args.fetch_offset), args.tz, target_lag, poll_s, poll_max_s)
+    if sched.effective_lag <= 0.0:
+        sched.effective_lag = target_lag
+
+    logger.info("[loop] interval=%ss initial_delay=%.1fs tz=%s target_lag=%.1fs "
+                "poll=%.0fs poll_max=%.0fs adaptive_lag=%s",
+                args.interval, float(args.fetch_offset), args.tz, target_lag,
+                poll_s, poll_max_s, "on" if adaptive else "off")
+
+    def hhmmss(epoch_s: float) -> str:
+        dt = factory_epoch_to_local_dt(epoch_s, tz) if tz else datetime.fromtimestamp(epoch_s)
+        return dt.strftime("%H:%M:%S")
+
+    def capped(target_epoch: float, now_e: float) -> float:
+        """Schutz gegen absurd weite Zielzeiten (z.B. falsche FactoryTimestamp-Zeitzone)."""
+        limit = now_e + interval_s + poll_max_s
+        if target_epoch > limit:
+            logger.warning("[schedule] Zielzeit liegt %.0fs in der Zukunft — begrenzt auf %.0fs. "
+                           "FactoryTimestamp/UTC prüfen!",
+                           target_epoch - now_e, limit - now_e)
+            return limit
+        return target_epoch
 
     # initial delay
     next_run = time.time() + float(args.fetch_offset)
@@ -1078,73 +1209,90 @@ def run_loop(
                 time.sleep(sleep_s)
 
             try:
-                meas_epoch, meas_local_dt = one_cycle(args, tz, client, mqtt_pub, auth, health, publish_state, logger)
+                meas_epoch, _ = one_cycle(
+                    args, tz, client, mqtt_pub, auth, health, publish_state, logger, sched
+                )
+                sched.consecutive_errors = 0
             except KeyboardInterrupt:
                 raise
             except Exception as ex:
-                logger.error("cycle failed: %s — Anker verloren, Fallback auf interval", ex)
-                meas_epoch, meas_local_dt = None, None
-                scheduler_state.anchor_lost = True
+                # Fehler lassen das Messraster unangetastet — nach Erholung
+                # rastet der Scheduler ohne Phasenverlust wieder ein.
+                sched.consecutive_errors += 1
+                backoff = min(err_retry_s * sched.consecutive_errors, interval_s)
+                logger.error("cycle failed (%dx): %s -> retry in %.0fs (Raster bleibt erhalten)",
+                             sched.consecutive_errors, ex, backoff)
+                next_run = time.time() + backoff
+                continue
 
-            # update scheduler state: detect new measurement
             now_e = time.time()
-            if meas_epoch is not None:
-                if scheduler_state.last_meas_epoch is None or meas_epoch != scheduler_state.last_meas_epoch:
-                    if scheduler_state.anchor_lost:
-                        logger.info("[schedule] re-sync auf Sensor-Takt (meas_epoch=%s)",
-                                    factory_epoch_to_local_dt(meas_epoch, tz).strftime("%Y-%m-%d %H:%M:%S")
-                                    if tz else datetime.fromtimestamp(meas_epoch).strftime("%Y-%m-%d %H:%M:%S"))
-                        scheduler_state.anchor_lost = False
-                    scheduler_state.last_meas_epoch = meas_epoch
-                    scheduler_state.last_meas_changed_epoch = now_e
+            is_new = meas_epoch is not None and (
+                sched.last_meas_epoch is None or meas_epoch != sched.last_meas_epoch
+            )
 
-            # schedule next run
-            if scheduler_state.last_meas_epoch is None:
-                # no valid meas yet -> simple interval
-                next_run = now_e + interval_s
-                logger.debug("[schedule] no last_meas -> next_run=%s",
-                             factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run))
-                continue
+            # --- Neue Messung: Raster nachführen und Ankunftsmodell lernen ---
+            if is_new:
+                observed_delay = now_e - meas_epoch
+                if adaptive:
+                    update_delay_model(sched, observed_delay, args, interval_s)
 
-            expected_next = scheduler_state.last_meas_epoch + interval_s + target_lag
+                if sched.stale:
+                    logger.info("[schedule] Cloud liefert wieder — zurück auf Raster (meas=%s)",
+                                hhmmss(meas_epoch))
+                    sched.stale = False
+                    sched.resync_count += 1
 
-            # Cap: falls expected_next unrealistisch weit in der Zukunft liegt
-            # (z.B. FactoryTimestamp-UTC-Annahme falsch), nicht ewig schlafen.
-            max_next = now_e + interval_s + poll_max_s
-            if expected_next > max_next:
-                logger.warning(
-                    "[schedule] expected_next liegt %.1fs in der Zukunft — cap auf %.0fs. "
-                    "FactoryTimestamp UTC-Annahme prüfen!",
-                    expected_next - now_e, interval_s + poll_max_s,
+                sched.last_meas_epoch = meas_epoch
+                sched.last_meas_changed_epoch = now_e
+                sched.poll_deadline = None
+                sched.consecutive_missed = 0
+
+                next_run = capped(
+                    next_grid_run(meas_epoch, interval_s, sched.effective_lag, now_e), now_e
                 )
-                expected_next = max_next
-
-            if now_e < expected_next:
-                next_run = expected_next
-                exp_local = factory_epoch_to_local_dt(expected_next, tz) if tz else datetime.fromtimestamp(expected_next)
-                lm_local = factory_epoch_to_local_dt(scheduler_state.last_meas_epoch, tz) if tz else datetime.fromtimestamp(scheduler_state.last_meas_epoch)
-                logger.debug("[schedule] last_meas=%s expected_next=%s sleep=%.3fs",
-                             lm_local.strftime("%Y-%m-%d %H:%M:%S"),
-                             exp_local.strftime("%Y-%m-%d %H:%M:%S"),
-                             max(0.0, next_run - time.time()))
+                logger.debug("[schedule] meas=%s ankunft=+%.1fs eff_lag=%.1fs -> next=%s (in %.1fs)",
+                             hhmmss(meas_epoch), observed_delay, sched.effective_lag,
+                             hhmmss(next_run), next_run - now_e)
                 continue
 
-            # past expected_next: cloud may still show old measurement -> poll window
-            poll_age = now_e - scheduler_state.last_meas_changed_epoch
-            if poll_age <= poll_max_s:
-                next_run = now_e + poll_s
-                nr_local = factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run)
-                logger.debug("[schedule] expected_next passed; meas_still=%s; POLL next_run=%s (poll_age=%.1fs)",
-                             factory_epoch_to_local_dt(scheduler_state.last_meas_epoch, tz).strftime("%Y-%m-%d %H:%M:%S") if tz else datetime.fromtimestamp(scheduler_state.last_meas_epoch),
-                             nr_local.strftime("%Y-%m-%d %H:%M:%S"),
-                             poll_age)
-            else:
-                scheduler_state.anchor_lost = True
+            # --- Keine neue Messung ---
+            if sched.last_meas_epoch is None:
                 next_run = now_e + interval_s
-                nr_local = factory_epoch_to_local_dt(next_run, tz) if tz else datetime.fromtimestamp(next_run)
-                logger.warning("[schedule] poll_max (%.0fs) überschritten (poll_age=%.1fs) — "
-                               "Anker verloren, Fallback auf interval next_run=%s",
-                               poll_max_s, poll_age, nr_local.strftime("%Y-%m-%d %H:%M:%S"))
+                logger.debug("[schedule] noch keine gültige Messung -> next=%s", hhmmss(next_run))
+                continue
+
+            if sched.stale:
+                next_run = now_e + stale_poll_s
+                logger.debug("[schedule] stale — nächster Check in %.0fs", stale_poll_s)
+                continue
+
+            if sched.poll_deadline is None:
+                # Poll-Fenster beginnt JETZT (nicht ab der letzten Messung), damit
+                # das volle Fenster fürs Warten auf die Cloud zur Verfügung steht.
+                sched.poll_deadline = now_e + poll_max_s
+
+            if now_e < sched.poll_deadline:
+                next_run = now_e + poll_s
+                logger.debug("[schedule] warte auf neue Messung (Fenster noch %.0fs) -> next=%s",
+                             sched.poll_deadline - now_e, hhmmss(next_run))
+                continue
+
+            # --- Fenster ausgeschöpft: Messung übersprungen, Raster bleibt erhalten ---
+            sched.consecutive_missed += 1
+            sched.missed_count += 1
+            sched.poll_deadline = None
+            next_run = capped(
+                next_grid_run(sched.last_meas_epoch, interval_s, sched.effective_lag, now_e), now_e
+            )
+
+            if sched.consecutive_missed >= stale_after and not sched.stale:
+                sched.stale = True
+                logger.warning("[schedule] Cloud liefert seit %d Intervallen nichts Neues — "
+                               "Stale-Modus (Check alle %.0fs)",
+                               sched.consecutive_missed, stale_poll_s)
+            else:
+                logger.info("[schedule] Messung übersprungen (%dx) — bleibe auf Raster, next=%s",
+                            sched.consecutive_missed, hhmmss(next_run))
     finally:
         if mqtt_pub:
             mqtt_pub.close()
