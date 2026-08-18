@@ -600,6 +600,7 @@ class HealthState:
     last_fetch_duration_ms: Optional[int] = None
 
     # Cloud timestamps
+    last_cloud_update_epoch: float = 0.0   # wann die cloud-Felder zuletzt frisch waren
     last_cloud_ts: str = ""               # Timestamp (string)
     last_cloud_factory_ts: str = ""       # FactoryTimestamp (string)
     last_cloud_lag_s: Optional[float] = None  # lag vs FactoryTimestamp (seconds)
@@ -909,6 +910,12 @@ def publish_health(
         },
 
         "cloud": {
+            # Bei einem fehlgeschlagenen Zyklus wird /health weiterhin publiziert,
+            # die cloud-Felder stammen dann aber noch vom letzten Erfolg. age_s macht
+            # das sichtbar: waechst der Wert ueber ein Intervall hinaus, sind ts/lag_s
+            # veraltet und kein aktueller Messwert.
+            "age_s": (round(time.time() - health.last_cloud_update_epoch, 1)
+                      if health.last_cloud_update_epoch > 0 else None),
             "ts": health.last_cloud_ts,
             "factory_ts": health.last_cloud_factory_ts,
             "lag_s": health.last_cloud_lag_s,
@@ -1088,6 +1095,7 @@ def one_cycle(
 
         health.last_cloud_ts = cloud_ts_str
         health.last_cloud_factory_ts = cloud_factory_ts_str
+        health.last_cloud_update_epoch = time.time()
 
         # --- Measurement time (robust): FactoryTimestamp -> epoch
         meas_epoch = parse_factory_epoch(cloud_factory_ts_str)
