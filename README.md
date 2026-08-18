@@ -40,8 +40,14 @@ The focus is on:
 - Configure (see below)
 - Start
 
-> ℹ️ The add-on uses a prebuilt GHCR image  
-> (`ghcr.io/spaceteddy/ha-addon-librelinkup`, lowercase)
+> ℹ️ The add-on installs a prebuilt multi-arch image from GHCR
+> (`ghcr.io/spaceteddy/librelinkup_mqtt`) — no build runs on your
+> Home Assistant host. Supported: `amd64`, `aarch64`, `armv7`.
+>
+> Because of this, every `version` in `config.yaml` needs a matching image
+> tag. The build workflows create it automatically when the version is
+> bumped. To build from source instead (e.g. when testing a branch as a
+> local add-on), remove the `image:` line from `config.yaml`.
 
 ---
 

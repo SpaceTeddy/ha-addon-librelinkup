@@ -4,6 +4,12 @@ slug: librelinkup_mqtt
 description: Fetch LibreLinkUp data and publish to MQTT (raw + filtered)
 url: https://github.com/SpaceTeddy/ha-addon-librelinkup
 
+# Vorgebautes Multi-Arch-Image von GHCR (amd64 / aarch64 / armv7).
+# Der Supervisor zieht <image>:<version> — zu JEDER Version in dieser Datei
+# muss ein passender GHCR-Tag existieren, sonst schlaegt Installation/Update fehl.
+# Die Build-Workflows erzeugen diesen Tag beim Versionsbump automatisch.
+image: ghcr.io/spaceteddy/librelinkup_mqtt
+
 arch:
   - amd64
   - aarch64
