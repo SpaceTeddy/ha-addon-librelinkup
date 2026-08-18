@@ -604,6 +604,7 @@ class HealthState:
     last_cloud_ts: str = ""               # Timestamp (string)
     last_cloud_factory_ts: str = ""       # FactoryTimestamp (string)
     last_cloud_lag_s: Optional[float] = None  # lag vs FactoryTimestamp (seconds)
+    last_cloud_stale_lag_s: Optional[float] = None  # lag einer verworfenen, aelteren Antwort
 
     # Timecode info
     last_local_ts: str = ""
@@ -919,6 +920,9 @@ def publish_health(
             "ts": health.last_cloud_ts,
             "factory_ts": health.last_cloud_factory_ts,
             "lag_s": health.last_cloud_lag_s,
+            # Nur gesetzt, wenn die Cloud zuletzt eine aeltere Messung lieferte,
+            # die verworfen wurde. null = letzte Antwort war in Ordnung.
+            "stale_lag_s": health.last_cloud_stale_lag_s,
             "target_lag_s": float(args.fetch_offset_target_lag),
 
             # display
@@ -1093,12 +1097,20 @@ def one_cycle(
         cloud_ts_str = gm.get("Timestamp") or ""
         cloud_factory_ts_str = gm.get("FactoryTimestamp") or ""
 
-        health.last_cloud_ts = cloud_ts_str
-        health.last_cloud_factory_ts = cloud_factory_ts_str
-        health.last_cloud_update_epoch = time.time()
-
         # --- Measurement time (robust): FactoryTimestamp -> epoch
         meas_epoch = parse_factory_epoch(cloud_factory_ts_str)
+
+        # Liefert die Cloud eine aeltere Messung als die zuletzt akzeptierte,
+        # darf sie die cloud-Felder nicht ueberschreiben — sonst springt lag_s
+        # zwischen dem echten Messalter und dem der veralteten Antwort hin und
+        # her. Sie wird separat als stale_lag_s ausgewiesen.
+        served_stale = (
+            meas_epoch is not None
+            and sched is not None
+            and sched.last_meas_epoch is not None
+            and meas_epoch < sched.last_meas_epoch
+        )
+
         if meas_epoch is not None:
             meas_local_dt = factory_epoch_to_local_dt(meas_epoch, tz)
             lag = time.time() - meas_epoch
@@ -1108,11 +1120,21 @@ def one_cycle(
                     "FactoryTimestamp UTC-Annahme prüfen! (factory_ts=%r)",
                     -lag, cloud_factory_ts_str,
                 )
-            health.last_cloud_lag_s = lag
+            if served_stale:
+                health.last_cloud_stale_lag_s = lag
+            else:
+                health.last_cloud_stale_lag_s = None
+                health.last_cloud_lag_s = lag
         else:
             # fallback: use Timestamp only for display; lag is unknown/unstable
             meas_local_dt = parse_libreview_ts_local(cloud_ts_str, tz)
+            health.last_cloud_stale_lag_s = None
             health.last_cloud_lag_s = None
+
+        if not served_stale:
+            health.last_cloud_ts = cloud_ts_str
+            health.last_cloud_factory_ts = cloud_factory_ts_str
+            health.last_cloud_update_epoch = time.time()
 
         health.last_meas_epoch = meas_epoch
         health.last_meas_local_dt = meas_local_dt
