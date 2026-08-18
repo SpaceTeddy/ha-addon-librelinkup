@@ -90,10 +90,18 @@ debug: false
 |------|-------------|
 | `email` | LibreLinkUp login email |
 | `password` | LibreLinkUp password |
-| `interval` | Fetch interval in seconds |
-| `fetch_offset` | Offset in seconds after app upload |
-| `fetch_offset_target_lag` | Desired lag in seconds after new cloud measurement |
+| `interval` | Expected sensor cadence in seconds (default 60) |
+| `fetch_offset` | Delay in seconds before the first fetch after start |
+| `fetch_offset_target_lag` | Minimum lag after a measurement before fetching |
 | `tz` | Timezone for timestamp comparison |
+
+### Scheduler
+| Option | Description |
+|------|-------------|
+| `adaptive_lag` | Learn how long the cloud takes to publish a measurement and wake up just before it arrives (recommended, default `true`) |
+| `poll_seconds` | Poll interval while waiting for a new measurement (default `10`) |
+| `poll_max_seconds` | How long to wait for a measurement before skipping it (default `120`) |
+| `stale_poll_seconds` | Check interval while the cloud is stale, e.g. the phone is offline (default `30`) |
 
 ### MQTT
 | Option | Description |
@@ -112,7 +120,7 @@ debug: false
 ### Publish
 | Option | Description |
 |------|-------------|
-| `publish_filtered` |  |
+| `publish_filtered` | Reduced JSON for Home Assistant / ESP32 (default) |
 | `publish_raw` | Full API JSON (debug / analysis) |
 
 ### Logging
@@ -138,6 +146,66 @@ Example (`mqtt_base_topic=librelinkup`, `master_id=MASTER`):
 |------|---------|
 | `librelinkup/MASTER/data` | Filtered JSON |
 | `librelinkup/MASTER/data_raw` | Raw API JSON (optional) |
+| `librelinkup/MASTER/health` | Health / diagnostics JSON |
+| `librelinkup/MASTER/status` | `online` / `offline` (retained, with LWT) |
+
+---
+
+## How the scheduler stays in sync
+
+A Libre sensor produces a reading every 60 seconds, but the LibreLinkUp cloud
+only shows it once the master's phone has uploaded it. That upload delay is
+variable — often 10 seconds, sometimes over a minute.
+
+The scheduler therefore works on the **sensor's measurement grid**:
+
+```
+next fetch = last_measurement + k × interval + lag        (k ≥ 1)
+```
+
+Because every fetch time is derived from the last measurement's
+`FactoryTimestamp`, the phase relationship to the sensor is never lost — not
+after a failed request, not after a skipped measurement, and not after the
+cloud has been stale for an hour.
+
+**Adaptive lag** (`adaptive_lag: true`): the add-on measures how long the cloud
+actually takes and wakes up shortly before the expected arrival, instead of
+waking early and polling repeatedly. On a cloud that consistently delivers at
+measurement + 45 s, it settles on waking at measurement + 35 s and catches the
+value on the first or second try.
+
+**When a measurement does not arrive**, it is polled every `poll_seconds` for
+up to `poll_max_seconds`. After that the measurement is skipped — but the grid
+is kept, so the next one is still expected at the right time. Two consecutive
+skips switch to stale mode (`stale_poll_seconds`), which keeps log noise and
+API load low while the phone is offline.
+
+**Request errors** never touch the grid. They are retried with a linearly
+growing backoff, capped at one `interval`.
+
+### Relevant log lines
+
+| Message | Meaning |
+|------|---------|
+| `Messung übersprungen (Nx) — bleibe auf Raster` | Cloud was late; grid intact |
+| `Cloud liefert seit N Intervallen nichts Neues — Stale-Modus` | Phone likely offline |
+| `Cloud liefert wieder — zurück auf Raster` | Recovered |
+| `cycle failed (Nx): … retry in Xs (Raster bleibt erhalten)` | Request error, grid intact |
+| `meas_epoch liegt Xs in der Zukunft` | `FactoryTimestamp` is not UTC — needs investigation |
+
+### Health fields (`.../health`)
+
+The `sched` block reports what the scheduler is doing:
+
+| Field | Meaning |
+|------|---------|
+| `effective_lag_s` | Current wake-up offset after a measurement |
+| `delay_ema_s` | Learned mean cloud delay |
+| `delay_dev_s` | Learned variation of that delay |
+| `stale` | Currently in stale mode |
+| `consecutive_missed` | Consecutive skipped measurements |
+| `missed_total` / `resync_count` | Totals since start |
+| `consecutive_errors` | Consecutive failed requests |
 
 ---
 
@@ -220,4 +288,4 @@ Use at your own risk.
 ✅ Safe handling of special characters  
 ✅ Timestamped logging  
 
-Future improvements (LWT, health topics, HA MQTT discovery) are possible but optional.
+LWT and health topics are implemented. HA MQTT discovery is still open.

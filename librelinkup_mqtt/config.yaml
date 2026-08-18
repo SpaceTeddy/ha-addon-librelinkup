@@ -33,6 +33,12 @@ options:
   fetch_offset_target_lag: 5.0
   tz: "Europe/Berlin"
 
+  # Scheduler
+  adaptive_lag: true
+  poll_seconds: 10.0
+  poll_max_seconds: 120.0
+  stale_poll_seconds: 30.0
+
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: ""
@@ -61,6 +67,11 @@ schema:
   fetch_offset: float(0,60)
   fetch_offset_target_lag: float(0,60)
   tz: str
+
+  adaptive_lag: bool
+  poll_seconds: float(1,60)
+  poll_max_seconds: float(10,600)
+  stale_poll_seconds: float(5,600)
 
   mqtt_host: str
   mqtt_port: int
